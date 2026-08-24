@@ -1,0 +1,434 @@
+/dts-v1/;
+
+/ {
+
+	metadata {
+		title = "Enable OV9281 Camera";
+		compatible = "radxa,rock-4d";
+		category = "camera";
+		exclusive = "GPIO3_D6\0csi2_dcphy0\0i2c4";
+		description = "Enable OV9281 Camera.";
+	};
+
+	fragment@0 {
+		target-path = "/";
+
+		__overlay__ {
+
+			external-camera-clock-24m {
+				status = "okay";
+				compatible = "fixed-clock";
+				clock-frequency = <0x16e3600>;
+				clock-output-names = "clk_cam_24m";
+				#clock-cells = <0x00>;
+				phandle = <0x01>;
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+			pinctrl-0 = <0xffffffff>;
+			#address-cells = <0x01>;
+			#size-cells = <0x00>;
+
+			ov9281@60 {
+				status = "okay";
+				compatible = "ovti,ov9281";
+				reg = <0x60>;
+				clocks = <0x01>;
+				pwdn-gpios = <0xffffffff 0x1e 0x00>;
+				clock-names = "xvclk";
+				rockchip,camera-module-index = <0x00>;
+				rockchip,camera-module-facing = "back";
+				rockchip,camera-module-name = "ov9281";
+				rockchip,camera-module-lens-name = "default";
+				phandle = <0x0a>;
+
+				port {
+
+					endpoint {
+						remote-endpoint = <0x02>;
+						data-lanes = <0x01 0x02>;
+						phandle = <0x03>;
+					};
+				};
+			};
+		};
+	};
+
+	fragment@2 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@3 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@4 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+
+			ports {
+				#address-cells = <0x01>;
+				#size-cells = <0x00>;
+
+				port@0 {
+					reg = <0x00>;
+					#address-cells = <0x01>;
+					#size-cells = <0x00>;
+
+					endpoint@2 {
+						reg = <0x02>;
+						remote-endpoint = <0x03>;
+						data-lanes = <0x01 0x02>;
+						phandle = <0x02>;
+					};
+				};
+
+				port@1 {
+					reg = <0x01>;
+					#address-cells = <0x01>;
+					#size-cells = <0x00>;
+
+					endpoint@0 {
+						reg = <0x00>;
+						remote-endpoint = <0x04>;
+						phandle = <0x05>;
+					};
+				};
+			};
+		};
+	};
+
+	fragment@5 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+
+			ports {
+				#address-cells = <0x01>;
+				#size-cells = <0x00>;
+
+				port@0 {
+					reg = <0x00>;
+					#address-cells = <0x01>;
+					#size-cells = <0x00>;
+
+					endpoint@1 {
+						reg = <0x01>;
+						remote-endpoint = <0x05>;
+						phandle = <0x04>;
+					};
+				};
+
+				port@1 {
+					reg = <0x01>;
+					#address-cells = <0x01>;
+					#size-cells = <0x00>;
+
+					endpoint@0 {
+						reg = <0x00>;
+						remote-endpoint = <0x06>;
+						phandle = <0x07>;
+					};
+				};
+			};
+		};
+	};
+
+	fragment@6 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@7 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@8 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+
+			port {
+
+				endpoint {
+					remote-endpoint = <0x07>;
+					phandle = <0x06>;
+				};
+			};
+		};
+	};
+
+	fragment@9 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+
+			port {
+
+				endpoint {
+					remote-endpoint = <0x08>;
+					phandle = <0x09>;
+				};
+			};
+		};
+	};
+
+	fragment@10 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@11 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@12 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+
+			port {
+				#address-cells = <0x01>;
+				#size-cells = <0x00>;
+
+				endpoint@0 {
+					reg = <0x00>;
+					remote-endpoint = <0x09>;
+					phandle = <0x08>;
+				};
+			};
+		};
+	};
+
+	fragment@13 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@14 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@15 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@16 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@17 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+			rockchip,pins = <0x03 0x10 0x0b 0xffffffff 0x03 0x0f 0x0b 0xffffffff>;
+		};
+	};
+
+	fragment@18 {
+		target = <0xffffffff>;
+
+		__overlay__ {
+
+			camera {
+
+				cam-pwdn-gpio {
+					rockchip,pins = <0x03 0x1e 0x00 0xffffffff>;
+					phandle = <0x0b>;
+				};
+			};
+		};
+	};
+
+	__symbols__ {
+		clk_cam_24m = "/fragment@0/__overlay__/external-camera-clock-24m";
+		ov9281 = "/fragment@1/__overlay__/ov9281@60";
+		ov9281_out0 = "/fragment@1/__overlay__/ov9281@60/port/endpoint";
+		mipidcphy0_in_ucam0 = "/fragment@4/__overlay__/ports/port@0/endpoint@2";
+		csidcphy0_out = "/fragment@4/__overlay__/ports/port@1/endpoint@0";
+		mipi0_csi2_input = "/fragment@5/__overlay__/ports/port@0/endpoint@1";
+		mipi0_csi2_output = "/fragment@5/__overlay__/ports/port@1/endpoint@0";
+		cif_mipi0_in0 = "/fragment@8/__overlay__/port/endpoint";
+		mipi_lvds_sditf = "/fragment@9/__overlay__/port/endpoint";
+		isp_vir0 = "/fragment@12/__overlay__/port/endpoint@0";
+		cam_pwdn_gpio = "/fragment@18/__overlay__/camera/cam-pwdn-gpio";
+	};
+
+	__fixups__ {
+		i2c4 = "/fragment@1:target:0";
+		i2c4m3_xfer = "/fragment@1/__overlay__:pinctrl-0:0\0/fragment@17:target:0";
+		gpio3 = "/fragment@1/__overlay__/ov9281@60:pwdn-gpios:0";
+		csi2_dphy0_hw = "/fragment@2:target:0";
+		csi2_dphy1_hw = "/fragment@3:target:0";
+		csi2_dcphy0 = "/fragment@4:target:0";
+		mipi0_csi2 = "/fragment@5:target:0";
+		rkcif = "/fragment@6:target:0";
+		rkcif_mmu = "/fragment@7:target:0";
+		rkcif_mipi_lvds = "/fragment@8:target:0";
+		rkcif_mipi_lvds_sditf = "/fragment@9:target:0";
+		rkisp_mmu = "/fragment@10:target:0";
+		rkisp = "/fragment@11:target:0";
+		rkisp_vir0 = "/fragment@12:target:0";
+		rkisp_vir0_sditf = "/fragment@13:target:0";
+		rkvpss = "/fragment@14:target:0";
+		rkvpss_mmu = "/fragment@15:target:0";
+		rkvpss_vir0 = "/fragment@16:target:0";
+		pcfg_pull_up_drv_level_3 = "/fragment@17/__overlay__:rockchip,pins:12\0/fragment@17/__overlay__:rockchip,pins:28";
+		pinctrl = "/fragment@18:target:0";
+		pcfg_pull_up = "/fragment@18/__overlay__/camera/cam-pwdn-gpio:rockchip,pins:12";
+	};
+
+	__local_fixups__ {
+
+		fragment@1 {
+
+			__overlay__ {
+
+				ov9281@60 {
+					clocks = <0x00>;
+
+					port {
+
+						endpoint {
+							remote-endpoint = <0x00>;
+						};
+					};
+				};
+			};
+		};
+
+		fragment@4 {
+
+			__overlay__ {
+
+				ports {
+
+					port@0 {
+
+						endpoint@2 {
+							remote-endpoint = <0x00>;
+						};
+					};
+
+					port@1 {
+
+						endpoint@0 {
+							remote-endpoint = <0x00>;
+						};
+					};
+				};
+			};
+		};
+
+		fragment@5 {
+
+			__overlay__ {
+
+				ports {
+
+					port@0 {
+
+						endpoint@1 {
+							remote-endpoint = <0x00>;
+						};
+					};
+
+					port@1 {
+
+						endpoint@0 {
+							remote-endpoint = <0x00>;
+						};
+					};
+				};
+			};
+		};
+
+		fragment@8 {
+
+			__overlay__ {
+
+				port {
+
+					endpoint {
+						remote-endpoint = <0x00>;
+					};
+				};
+			};
+		};
+
+		fragment@9 {
+
+			__overlay__ {
+
+				port {
+
+					endpoint {
+						remote-endpoint = <0x00>;
+					};
+				};
+			};
+		};
+
+		fragment@12 {
+
+			__overlay__ {
+
+				port {
+
+					endpoint@0 {
+						remote-endpoint = <0x00>;
+					};
+				};
+			};
+		};
+	};
+};

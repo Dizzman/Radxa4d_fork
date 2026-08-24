@@ -1286,11 +1286,11 @@ static int ov9281_probe(struct i2c_client *client,
 		return -EINVAL;
 	}
 
-	ov9281->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_ASIS);
+	ov9281->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(ov9281->reset_gpio))
 		dev_warn(dev, "Failed to get reset-gpios\n");
 
-	ov9281->pwdn_gpio = devm_gpiod_get(dev, "pwdn", GPIOD_ASIS);
+	ov9281->pwdn_gpio = devm_gpiod_get(dev, "pwdn", GPIOD_OUT_LOW);
 	if (IS_ERR(ov9281->pwdn_gpio))
 		dev_warn(dev, "Failed to get pwdn-gpios\n");
 
