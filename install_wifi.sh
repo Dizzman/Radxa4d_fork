@@ -71,8 +71,30 @@ ok "x86-64 бинарники удалены, если были (make перес
 log "Синхронизация конфига..."
 run make olddefconfig
 
-log "Сборка всех scripts..."
-run make scripts
+# ВАЖНО: 'make prepare'/'make scripts' иногда уходят в бесконечную
+# рекурсию (make[N] -> prepare0 -> make[N+1] -> prepare0 -> ...,
+# видели счётчик за сотню вложенных вызовов) — обычно из-за протёкшей
+# переменной окружения (KBUILD_EXTMOD/SUBDIRS) от более ранней ручной
+# команды в этой же сессии. timeout не лечит причину, но не даёт
+# зависнуть навсегда — если действительно зациклилось, узнаем об этом
+# за 2 минуты, а не через час ожидания.
+log "make prepare (таймаут 2 минуты — на случай зацикливания prepare0)..."
+RC=0
+timeout 120 make prepare || RC=$?
+if [[ "$RC" -eq 124 ]]; then
+    err "make prepare не уложился в 2 минуты — похоже на зацикливание (make[N] -> prepare0 -> ...). Проверьте окружение: env | grep -iE 'kbuild|subdirs'. Попробуйте в НОВОМ терминале (без унаследованных переменных)."
+elif [[ "$RC" -ne 0 ]]; then
+    err "make prepare завершился с ошибкой (код $RC) — смотрите вывод выше."
+fi
+
+log "Сборка всех scripts (таймаут 2 минуты)..."
+RC=0
+timeout 120 make scripts || RC=$?
+if [[ "$RC" -eq 124 ]]; then
+    err "make scripts не уложился в 2 минуты — похоже на зацикливание. Проверьте окружение: env | grep -iE 'kbuild|subdirs'. Попробуйте в НОВОМ терминале."
+elif [[ "$RC" -ne 0 ]]; then
+    err "make scripts завершился с ошибкой (код $RC) — смотрите вывод выше."
+fi
 
 log "Проверка, что всё собралось для ARM:"
 for bin in scripts/basic/fixdep scripts/mod/modpost scripts/kconfig/conf; do
