@@ -3,19 +3,7 @@
 # install_wifi.sh — установка WiFi (AIC8800) на плате ROCK 4D.
 # Запускать ПОСЛЕ install_kernel.sh и "sudo reboot" в новое ядро.
 #
-# Состоит из двух частей:
-#   1. Сборка scripts   — host-инструменты (fixdep/modpost/conf), пришедшие
-#                          из WSL как x86_64-бинарники, пересобираются
-#                          нативно под ARM (иначе DKMS не сможет собрать
-#                          модуль — "Exec format error").
-#   2. Установка драйвера — официальный .deb-пакет aic8800-usb-dkms +
-#                          aic8800-firmware с GitHub Releases; dpkg сам
-#                          запускает DKMS, который соберёт модуль против
-#                          уже подготовленных на шаге 1 заголовков.
-#
-# Использование:
-#   sudo ./install_wifi.sh
-#
+
 set -uo pipefail
 set -e
 
@@ -56,7 +44,9 @@ run apt-get install -y flex bison build-essential libssl-dev libelf-dev bc devic
 log "Переход в $HEADERS_DIR"
 run cd "$HEADERS_DIR"
 
-log "Удаление всех .o файлов..."
+# Очистка от старых бинарников
+log "Очистка старых файлов..."
+run make clean 2>/dev/null || true
 find . -name "*.o" -delete 2>/dev/null || true
 find . -name "*.cmd" -delete 2>/dev/null || true
 find . -name "*.d" -delete 2>/dev/null || true
@@ -64,36 +54,51 @@ find . -name "*.a" -delete 2>/dev/null || true
 find . -name "*.mod" -delete 2>/dev/null || true
 find . -name "*.ko" -delete 2>/dev/null || true
 
-log "Удаление всех x86-64 бинарников, доставшихся из WSL..."
+log "Удаление x86-64 бинарников, доставшихся из WSL..."
 find . -type f -executable -exec file {} \; 2>/dev/null | grep "x86-64" | cut -d: -f1 | xargs rm -f 2>/dev/null || true
-ok "x86-64 бинарники удалены, если были (make пересоберёт нативно)"
+ok "x86-64 бинарники удалены"
 
+# Синхронизация конфига
 log "Синхронизация конфига..."
 run make olddefconfig
 
-# ВАЖНО: 'make prepare'/'make scripts' иногда уходят в бесконечную
-# рекурсию (make[N] -> prepare0 -> make[N+1] -> prepare0 -> ...,
-# видели счётчик за сотню вложенных вызовов) — обычно из-за протёкшей
-# переменной окружения (KBUILD_EXTMOD/SUBDIRS) от более ранней ручной
-# команды в этой же сессии. timeout не лечит причину, но не даёт
-# зависнуть навсегда — если действительно зациклилось, узнаем об этом
-# за 2 минуты, а не через час ожидания.
-log "make prepare (таймаут 2 минуты — на случай зацикливания prepare0)..."
-RC=0
-timeout 120 make prepare || RC=$?
-if [[ "$RC" -eq 124 ]]; then
-    err "make prepare не уложился в 2 минуты — похоже на зацикливание (make[N] -> prepare0 -> ...). Проверьте окружение: env | grep -iE 'kbuild|subdirs'. Попробуйте в НОВОМ терминале (без унаследованных переменных)."
-elif [[ "$RC" -ne 0 ]]; then
-    err "make prepare завершился с ошибкой (код $RC) — смотрите вывод выше."
-fi
+# КРИТИЧЕСКИ ВАЖНО: Убираем переменные, которые могут вызвать рекурсию
+log "Очистка переменных окружения, влияющих на сборку..."
+unset KBUILD_EXTMOD
+unset SUBDIRS
+unset M
+unset KBUILD_SRC
+unset O
+unset CROSS_COMPILE
 
-log "Сборка всех scripts (таймаут 2 минуты)..."
-RC=0
-timeout 120 make scripts || RC=$?
-if [[ "$RC" -eq 124 ]]; then
-    err "make scripts не уложился в 2 минуты — похоже на зацикливание. Проверьте окружение: env | grep -iE 'kbuild|subdirs'. Попробуйте в НОВОМ терминале."
-elif [[ "$RC" -ne 0 ]]; then
-    err "make scripts завершился с ошибкой (код $RC) — смотрите вывод выше."
+# Сборка scripts по частям, избегая рекурсии
+log "Сборка scripts (пошагово, без make prepare)..."
+log "Шаг 1: Сборка fixdep..."
+run make -C "$HEADERS_DIR" scripts/basic/fixdep
+
+log "Шаг 2: Сборка modpost..."
+run make -C "$HEADERS_DIR" scripts/mod/modpost
+
+log "Шаг 3: Сборка kconfig/conf..."
+run make -C "$HEADERS_DIR" scripts/kconfig/conf
+
+log "Шаг 4: Сборка остальных скриптов..."
+run make -C "$HEADERS_DIR" scripts_basic
+
+log "Шаг 5: Сборка модульных скриптов..."
+run make -C "$HEADERS_DIR" scripts
+
+# Проверяем, что все необходимые файлы для DKMS существуют
+log "Создание необходимых файлов для DKMS..."
+touch "$HEADERS_DIR/Module.symvers" 2>/dev/null || true
+touch "$HEADERS_DIR/modules.builtin" 2>/dev/null || true
+touch "$HEADERS_DIR/modules.order" 2>/dev/null || true
+
+# Создаем .config если его нет
+if [ ! -f "$HEADERS_DIR/.config" ]; then
+    log "Создание .config..."
+    make -C "$HEADERS_DIR" defconfig 2>/dev/null || true
+    make -C "$HEADERS_DIR" olddefconfig 2>/dev/null || true
 fi
 
 log "Проверка, что всё собралось для ARM:"
@@ -104,7 +109,9 @@ for bin in scripts/basic/fixdep scripts/mod/modpost scripts/kconfig/conf; do
         if file "$bin" 2>/dev/null | grep -qiE "ARM aarch64|ELF 64-bit LSB.*ARM"; then
             ok "$bin — ARM64"
         else
-            err "$bin НЕ ARM64-бинарник"
+            warn "$bin не ARM64-бинарник, пересборка..."
+            rm -f "$bin"
+            make -C "$HEADERS_DIR" "$bin"
         fi
     else
         err "$bin не найден"
@@ -122,17 +129,26 @@ echo ""
 
 log "Переход в /tmp"
 run cd /tmp
+
 log "Скачивание пакетов (версия $AIC8800_RELEASE_VER)..."
 run wget -q "https://github.com/radxa-pkg/aic8800/releases/download/${AIC8800_RELEASE_TAG}/aic8800-usb-dkms_${AIC8800_RELEASE_VER}_all.deb"
 run wget -q "https://github.com/radxa-pkg/aic8800/releases/download/${AIC8800_RELEASE_TAG}/aic8800-firmware_${AIC8800_RELEASE_VER}_all.deb"
 
 log "Установка пакетов (dpkg сам запустит DKMS-сборку против $HEADERS_DIR)..."
-run dpkg -i /tmp/aic8800-usb-dkms_*.deb /tmp/aic8800-firmware_*.deb
+run dpkg -i /tmp/aic8800-usb-dkms_*.deb /tmp/aic8800-firmware_*.deb || {
+    log "Установка завершилась с ошибкой, пробуем исправить зависимости..."
+    apt-get install -f -y
+    run dpkg -i /tmp/aic8800-usb-dkms_*.deb /tmp/aic8800-firmware_*.deb
+}
+
+# Проверяем статус DKMS
+log "Проверка статуса DKMS..."
+dkms status
 
 log "Загрузка модулей..."
-run modprobe aic8800_fdrv_usb || warn "Не удалось загрузить aic8800_fdrv_usb"
-run modprobe aic_load_fw_usb || warn "Не удалось загрузить aic_load_fw_usb"
-run modprobe aic_btusb_usb || warn "Не удалось загрузить aic_btusb_usb"
+run modprobe aic8800_fdrv_usb 2>/dev/null || warn "Не удалось загрузить aic8800_fdrv_usb"
+run modprobe aic_load_fw_usb 2>/dev/null || warn "Не удалось загрузить aic_load_fw_usb"
+run modprobe aic_btusb_usb 2>/dev/null || warn "Не удалось загрузить aic_btusb_usb"
 
 echo ""
 log "Проверка загруженных модулей:"
@@ -167,5 +183,12 @@ else
     echo "   echo 0 | sudo tee <НАЙДЕННЫЙ_ПУТЬ>/authorized"
     echo "   sleep 2"
     echo "   echo 1 | sudo tee <НАЙДЕННЫЙ_ПУТЬ>/authorized"
+    
+    echo ""
+    echo "4. Проверка логов:"
+    echo "   dmesg | grep -i aic8800"
+    echo "   dmesg | grep -i firmware"
+    echo "   dmesg | grep -i usb | tail -20"
+    echo "   dmesg | grep -i wifi"
 fi
 echo "============================================================"

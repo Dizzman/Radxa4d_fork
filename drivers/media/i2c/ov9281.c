@@ -1184,7 +1184,7 @@ static int ov9281_initialize_controls(struct ov9281 *ov9281)
 	ov9281->strobe = v4l2_ctrl_new_std(handler, &ov9281_ctrl_ops,
 				V4L2_CID_BRIGHTNESS, 1,
 				exposure_max/16, 1,
-				0xc8);
+				exposure_max/32);
 
 	ov9281->test_pattern = v4l2_ctrl_new_std_menu_items(handler,
 				&ov9281_ctrl_ops, V4L2_CID_TEST_PATTERN,
@@ -1277,7 +1277,7 @@ static int ov9281_probe(struct i2c_client *client,
 	}
 
 	ov9281->client = client;
-	ov9281->cur_mode = &supported_modes[0];
+	ov9281->cur_mode = &supported_modes[1];
 	ov9281->is_thunderboot = IS_ENABLED(CONFIG_VIDEO_ROCKCHIP_THUNDER_BOOT_ISP);
 
 	ov9281->xvclk = devm_clk_get(dev, "xvclk");

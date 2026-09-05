@@ -8,22 +8,21 @@
 # x86_64-бинарники, которые не запустятся на ARM-плате. Компилировать их
 # и сам WiFi-драйвер нужно НАТИВНО, на самой плате.
 #
-# Создаются ДВА архива:
-#   ov9281-kernel-<версия>.tar.gz   — Image + modules + dtb + overlay +
-#                                     config-plain + live_auto_exposure.cpp
-#   kernel-headers-<версия>.tar.gz  — Makefile/.config/Module.symvers/
-#                                     include/arch/scripts/Kconfig/tools —
-#                                     нужны на плате, чтобы собрать WiFi
+# Создаётся ОДИН архив ov9281-<версия>.tar.gz с двумя подпапками внутри:
+#   boot/     — Image + modules + dtb + overlay + config-plain +
+#               live_auto_exposure.cpp
+#   headers/  — Makefile/.config/Module.symvers/include/arch/scripts/
+#               Kconfig/tools — нужны на плате, чтобы собрать WiFi
 #
 # Команды:
-#   ./deploy_ov9281.sh build <ИМЯ>    — собрать ядро + упаковать в 2 архива
+#   ./deploy_ov9281.sh build <ИМЯ>    — собрать ядро + упаковать в ОДИН архив
 #   ./deploy_ov9281.sh package        — упаковать отдельно (build уже делает это сама)
 #   ./deploy_ov9281.sh deploy <IP>    — ТОЛЬКО отправить готовое на плату
 #   ./deploy_ov9281.sh all <IP> <ИМЯ> — build, затем deploy, подряд
 #   ./deploy_ov9281.sh clean          — полная очистка (.config сохраняется)
 #
 # На плате после deploy:
-#   sudo ./install_kernel.sh   — ядро + overlay + распаковка headers
+#   sudo ./install_kernel.sh   — ядро + overlay + распаковка headers (из boot/+headers/)
 #   sudo reboot
 #   sudo ./install_wifi.sh     — сборка scripts + WiFi-драйвера НАТИВНО, установка, проверка
 #
@@ -97,7 +96,7 @@ cmd_clean() {
     ok "Ядро очищено (.config удалён — build сам возьмёт свежий из эталона)"
 
     log "Удаление архивов..."
-    run rm -f ov9281-kernel-*.tar.gz kernel-headers-*.tar.gz
+    run rm -f ov9281-*.tar.gz
 
     log "Удаление временных файлов..."
     run rm -rf /tmp/modules_* /tmp/kernel_pkg_* /tmp/headers_*
@@ -208,7 +207,28 @@ cmd_build() {
         die "Overlay .dts не найден (ожидается ./overlay/*.dts) — камера не заработает."
     fi
 
-    step "1.3 СБОРКА Image + modules + dtbs"
+    # --- НОВОЕ: точечная компиляция ТОЛЬКО drivers/media/i2c/ov9281.o ---
+    # Даёт быструю обратную связь по ошибкам именно в этом (патченном)
+    # файле, не дожидаясь полной сборки Image+modules+dtbs (которая
+    # занимает намного больше времени). Если файл не компилируется —
+    # нет смысла запускать долгую полную сборку вообще.
+    step "1.3 ТОЧЕЧНАЯ КОМПИЛЯЦИЯ drivers/media/i2c/ov9281.c"
+
+    log "Удаление старого .o (если есть) — иначе make может решить, что пересборка не нужна..."
+    run rm -f drivers/media/i2c/ov9281.o drivers/media/i2c/.ov9281.o.cmd
+
+    log "Компиляция ТОЛЬКО ov9281.o..."
+    if run make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE drivers/media/i2c/ov9281.o; then
+        if [[ -f drivers/media/i2c/ov9281.o ]]; then
+            ok "drivers/media/i2c/ov9281.o собран успешно ($(ls -la drivers/media/i2c/ov9281.o | awk '{print $5}') байт)"
+        else
+            die "make завершился без ошибки, но ov9281.o не создан — странная ситуация, проверьте вручную."
+        fi
+    else
+        die "Ошибка компиляции drivers/media/i2c/ov9281.c — смотрите вывод выше. Полная сборка ядра остановлена, чтобы не тратить время впустую."
+    fi
+
+    step "1.4 СБОРКА Image + modules + dtbs"
 
     log "Сборка (параллельно: $(nproc) потоков)..."
     run make -j$(nproc) ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE Image modules dtbs || die "Ошибка сборки ядра"
@@ -221,6 +241,36 @@ cmd_build() {
     ok "ЯДРО СОБРАНО! Версия: $kver"
     log "Image: $(ls -la arch/arm64/boot/Image | awk '{print $5, $9}')"
 
+    # --- ДОКАЗАТЕЛЬСТВО, что ov9281.c реально скомпилирован и попал
+    # ВНУТРЬ Image (built-in, а не отдельный .ko — .ko у built-in кода
+    # просто не существует в принципе, это не ошибка, а прямое следствие
+    # того, что CONFIG_VIDEO_OV9281=y). Проверяем по символам в vmlinux
+    # (ELF с полной отладочной информацией) или, если vmlinux не сохранён,
+    # по System.map (список всех символов ядра с адресами).
+    step "ПРОВЕРКА: ov9281 РЕАЛЬНО СКОМПИЛИРОВАН И ВКОМПИЛИРОВАН В IMAGE"
+    log "ov9281 — built-in (CONFIG_VIDEO_OV9281=y), поэтому .ko НЕ существует"
+    log "в принципе — код становится частью самого Image, а не отдельным"
+    log "файлом модуля. Проверяем по символам ядра, что компиляция и"
+    log "линковка реально прошли успешно:"
+
+    local ov9281_symbols=""
+    if [[ -f vmlinux ]]; then
+        ov9281_symbols=$(nm vmlinux 2>/dev/null | grep -i ov9281 || true)
+    fi
+    if [[ -z "$ov9281_symbols" && -f System.map ]]; then
+        ov9281_symbols=$(grep -i ov9281 System.map || true)
+    fi
+
+    if [[ -n "$ov9281_symbols" ]]; then
+        ok "Символы ov9281 найдены в собранном ядре (доказательство успешной компиляции+линковки):"
+        echo "$ov9281_symbols" | head -15 | tee -a "$LOG"
+        local symcount
+        symcount=$(echo "$ov9281_symbols" | wc -l)
+        log "Всего найдено символов: $symcount"
+    else
+        die "Символы ov9281 НЕ найдены ни в vmlinux, ни в System.map — компиляция могла пройти, но код не попал в финальный Image! Проверьте вручную."
+    fi
+
     step "ИТОГ СБОРКИ"
     ok "СБОРКА ЗАВЕРШЕНА! Версия: $kver"
     log "Дальше: упаковка в 2 архива (boot + headers)..."
@@ -229,16 +279,16 @@ cmd_build() {
 }
 
 # ============================================
-# PACKAGE — ДВА архива: boot-пакет (ядро+overlay+cpp) и headers (для
-# сборки WiFi НА ПЛАТЕ). Никакой сборки AIC8800/scripts здесь нет —
-# scripts копируются КАК ЕСТЬ (x86-бинарники), плата пересоберёт их сама.
+# PACKAGE — ОДИН архив (boot/ + headers/ подпапки внутри). Никакой сборки
+# AIC8800/scripts здесь нет — scripts копируются КАК ЕСТЬ (x86-бинарники),
+# плата пересоберёт их сама.
 # ============================================
 cmd_package() {
     local kver
     kver=$(cat .ov9281_kver 2>/dev/null) || die "Сначала выполните build"
     [[ -f arch/arm64/boot/Image ]] || die "Нет Image"
 
-    step "УПАКОВКА (boot + headers)"
+    step "УПАКОВКА В ОДИН АРХИВ (boot/ + headers/)"
 
     log "Установка модулей ядра..."
     local modpath="/tmp/modules_$kver"
@@ -246,68 +296,78 @@ cmd_package() {
     run mkdir -p "$modpath"
     run make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE INSTALL_MOD_PATH="$modpath" modules_install || die "Ошибка установки модулей"
 
-    log "=== Архив 1: boot-пакет (ov9281-kernel-$kver.tar.gz) ==="
-    local pkgdir="/tmp/kernel_pkg_$kver"
-    run rm -rf "$pkgdir"
-    run mkdir -p "$pkgdir/lib"
-    run cp -r "$modpath/lib/modules" "$pkgdir/lib/"
-    run cp arch/arm64/boot/Image "$pkgdir/"
-    cp arch/arm64/boot/dts/rockchip/rk3576-rock-4d.dtb "$pkgdir/" 2>/dev/null || true
-    cp arch/arm64/boot/dts/rockchip/rk3576-rock-4d-spi.dtb "$pkgdir/" 2>/dev/null || true
-    run cp .config "$pkgdir/config-plain"
+    local staging="/tmp/ov9281_pkg_$kver"
+    run rm -rf "$staging"
+    run mkdir -p "$staging/boot/lib"
+    run mkdir -p "$staging/headers"
+
+    log "=== boot/ — ядро, модули, dtb, overlay, .cpp ==="
+    run cp -r "$modpath/lib/modules" "$staging/boot/lib/"
+    run cp arch/arm64/boot/Image "$staging/boot/"
+    cp arch/arm64/boot/dts/rockchip/rk3576-rock-4d.dtb "$staging/boot/" 2>/dev/null || true
+    cp arch/arm64/boot/dts/rockchip/rk3576-rock-4d-spi.dtb "$staging/boot/" 2>/dev/null || true
+    run cp .config "$staging/boot/config-plain"
 
     local overlay
     overlay=$(find . -maxdepth 2 -iname "*ov9281*.dts" | head -1)
     [[ -n "$overlay" ]] || die "Overlay .dts не найден — проверьте ./overlay/*.dts"
-    run cp "$overlay" "$pkgdir/overlay.dts"
+    run cp "$overlay" "$staging/boot/overlay.dts"
     ok "Overlay OV9281 добавлен: $overlay"
 
     if [[ -f "$CUR_DIR/live_auto_exposure.cpp" ]]; then
-        run cp "$CUR_DIR/live_auto_exposure.cpp" "$pkgdir/"
+        run cp "$CUR_DIR/live_auto_exposure.cpp" "$staging/boot/"
         ok "live_auto_exposure.cpp добавлен"
     else
         warn "live_auto_exposure.cpp не найден рядом со скриптом — не будет включён в архив."
     fi
 
-    run tar czf "$CUR_DIR/ov9281-kernel-$kver.tar.gz" -C "$pkgdir" . || die "Ошибка создания boot-архива"
-    ok "Boot-архив создан: ov9281-kernel-$kver.tar.gz ($(du -h "$CUR_DIR/ov9281-kernel-$kver.tar.gz" | cut -f1))"
-
-    log "=== Архив 2: заголовки для сборки WiFi на плате (kernel-headers-$kver.tar.gz) ==="
-    local hdir="/tmp/headers_$kver"
-    run rm -rf "$hdir"
-    run mkdir -p "$hdir"
-
-    run cp -a Makefile .config Module.symvers "$hdir/"
-    run cp -a include "$hdir/"
-    run mkdir -p "$hdir/arch"
-    run cp -a arch/arm64 "$hdir/arch/"
+    log "=== headers/ — заголовки для сборки WiFi на плате ==="
+    run cp -a Makefile .config Module.symvers "$staging/headers/"
+    run cp -a include "$staging/headers/"
+    run mkdir -p "$staging/headers/arch"
+    run cp -a arch/arm64 "$staging/headers/arch/"
 
     # scripts/ копируется КАК ЕСТЬ (x86-бинарники из WSL) — плата
     # пересоберёт их сама, нативно, командой install_wifi.sh.
-    run cp -a scripts "$hdir/"
+    run cp -a scripts "$staging/headers/"
 
     # scripts/sorttable.c включает <tools/be_byteshift.h> — без каталога
     # tools/include пересборка 'scripts' на плате упадёт с "No such file".
-    run mkdir -p "$hdir/tools"
-    run cp -a tools/include "$hdir/tools/"
+    run mkdir -p "$staging/headers/tools"
+    run cp -a tools/include "$staging/headers/tools/"
 
     # ВСЕ Kconfig-файлы по дереву — scripts/kconfig/conf при ЛЮБОМ запуске
     # (даже просто syncconfig) обязан прочитать весь граф Kconfig целиком.
     log "Копирование ВСЕХ Kconfig-файлов по дереву..."
-    run find . -name "Kconfig*" -exec cp --parents {} "$hdir/" \;
+    run find . -name "Kconfig*" -exec cp --parents {} "$staging/headers/" \;
 
-    echo "$kver" > "$hdir/kernel.release"
-    run tar czf "$CUR_DIR/kernel-headers-$kver.tar.gz" -C "$hdir" . || die "Ошибка создания headers-архива"
-    ok "Headers-архив создан: kernel-headers-$kver.tar.gz ($(du -h "$CUR_DIR/kernel-headers-$kver.tar.gz" | cut -f1))"
+    echo "$kver" > "$staging/headers/kernel.release"
+
+    log "=== Сборка единого архива ov9281-$kver.tar.gz ==="
+    run tar czf "$CUR_DIR/ov9281-$kver.tar.gz" -C "$staging" . || die "Ошибка создания архива"
+    ok "Архив создан: ov9281-$kver.tar.gz ($(du -h "$CUR_DIR/ov9281-$kver.tar.gz" | cut -f1))"
+
+    log "=== Список файлов в архиве (первые 60 на экран, полный список — в $LOG) ==="
+    tar tzvf "$CUR_DIR/ov9281-$kver.tar.gz" > /tmp/pkg_manifest_$kver.txt
+    cat /tmp/pkg_manifest_$kver.txt >> "$LOG"
+    head -60 /tmp/pkg_manifest_$kver.txt
+    log "Всего файлов в архиве: $(wc -l < /tmp/pkg_manifest_$kver.txt) (полный список — в $LOG)"
+
+    if grep -qi "^\./boot/.*ov9281" /tmp/pkg_manifest_$kver.txt; then
+        warn "Внимание: в boot/ НАЙДЕНО что-то с именем ov9281 — это НЕ ожидалось (ov9281 должен быть built-in внутри Image, не отдельным файлом). Проверьте вручную:"
+        grep -i "^\./boot/.*ov9281" /tmp/pkg_manifest_$kver.txt
+    else
+        log "В boot/ НЕТ отдельного ov9281.ko — это ОЖИДАЕМО: код built-in внутри самого Image (см. проверку символов выше в этом логе)."
+    fi
 
     log "Удаление временных staging-папок..."
-    run rm -rf "$modpath" "$pkgdir" "$hdir"
+    run rm -rf "$modpath" "$staging"
 
     step "УПАКОВКА ЗАВЕРШЕНА"
 }
 
 # ============================================
-# DEPLOY — ТОЛЬКО отправка уже готовых архивов + install-скриптов на плату.
+# DEPLOY — ТОЛЬКО отправка единого архива + install-скриптов на плату.
 # ============================================
 cmd_deploy() {
     local ip="$1"
@@ -318,10 +378,8 @@ cmd_deploy() {
     kver=$(cat .ov9281_kver)
     log "Версия: $kver"
 
-    local boot="$CUR_DIR/ov9281-kernel-$kver.tar.gz"
-    local headers="$CUR_DIR/kernel-headers-$kver.tar.gz"
-    [[ -f "$boot" ]]    || die "Не найден $boot — сначала выполните: $0 build <ИМЯ>"
-    [[ -f "$headers" ]] || die "Не найден $headers — сначала выполните: $0 build <ИМЯ>"
+    local pkg="$CUR_DIR/ov9281-$kver.tar.gz"
+    [[ -f "$pkg" ]] || die "Не найден $pkg — сначала выполните: $0 build <ИМЯ>"
 
     step "ОТПРАВКА НА ПЛАТУ $ip"
 
@@ -330,12 +388,10 @@ cmd_deploy() {
     done
 
     local files_to_copy=(
-        "$boot"
-        "$headers"
+        "$pkg"
         "$CUR_DIR/install_kernel.sh"
         "$CUR_DIR/install_wifi.sh"
     )
-    [[ -f "$CUR_DIR/live_auto_exposure.cpp" ]] && files_to_copy+=("$CUR_DIR/live_auto_exposure.cpp")
 
     echo ""
     log "Отправляю на $BOARD_USER@$ip:"
@@ -392,8 +448,13 @@ WiFi (AIC8800) собирается ОТДЕЛЬНО, НА ПЛАТЕ, скри�
 правок конфига (были случаи случайно включавшихся CONFIG_DRM_NOUVEAU и
 подобных нерелевантных драйверов, ломавших сборку).
 
+build теперь ДОПОЛНИТЕЛЬНО точечно компилирует ТОЛЬКО
+drivers/media/i2c/ov9281.o перед полной сборкой Image+modules+dtbs —
+если в этом (патченном) файле есть ошибка, вы узнаете об этом за
+секунды, а не после долгой полной сборки.
+
 Команды:
-  $0 build <ИМЯ>    — взять эталонный конфиг, собрать ядро, упаковать в 2 архива
+  $0 build <ИМЯ>    — взять эталонный конфиг, собрать ядро, упаковать в ОДИН архив
   $0 package        — упаковать отдельно (build уже делает это сама)
   $0 deploy <IP>    — ТОЛЬКО отправить готовое на плату (+install-скрипты)
   $0 all <IP> <ИМЯ> — build, затем deploy, подряд
@@ -406,13 +467,13 @@ WiFi (AIC8800) собирается ОТДЕЛЬНО, НА ПЛАТЕ, скри�
   ssh radxa@<IP_платы> "zcat /proc/config.gz" > radxa4d.config
 
 На плате после deploy:
-  sudo ./install_kernel.sh   — ядро + overlay + распаковка headers (БЕЗ сборки)
+  sudo ./install_kernel.sh   — ядро + overlay + распаковка headers (из одного архива, БЕЗ сборки)
   sudo reboot
   sudo ./install_wifi.sh     — сборка scripts + WiFi НАТИВНО, установка, проверка
 
 Файлы:
-  ov9281-kernel-<версия>.tar.gz   — Image + modules + dtb + overlay + config + .cpp
-  kernel-headers-<версия>.tar.gz  — заголовки для сборки WiFi на плате
+  ov9281-<версия>.tar.gz  — ОДИН архив: boot/ (Image+modules+dtb+overlay+cpp)
+                            + headers/ (для сборки WiFi на плате)
 
 Лог: $LOG
 ============================================================
@@ -424,10 +485,10 @@ EOF
 # ============================================
 case "${1:-}" in
     clean)   STEP_TOTAL=2; cmd_clean ;;
-    build)   STEP_TOTAL=7; shift; cmd_build "$@" ;;
+    build)   STEP_TOTAL=9; shift; cmd_build "$@" ;;
     package) STEP_TOTAL=2; cmd_package ;;
     deploy)  STEP_TOTAL=1; shift; cmd_deploy "$@" ;;
-    all)     STEP_TOTAL=9; shift; cmd_all "$@" ;;
+    all)     STEP_TOTAL=11; shift; cmd_all "$@" ;;
     help|"") cmd_help ;;
     *)       echo "Неизвестная команда: $1"; cmd_help ;;
 esac
