@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# deploy_ov9281.sh — сборка ЯДРА ROCK 4D с OV9281 (built-in камера)
+# full_deploy_ov9281.sh — сборка ЯДРА ROCK 4D с OV9281 (built-in камера)
 # + КРОСС-сборка WiFi-драйвера AIC8800 (4.0) здесь же, в WSL.
 #
 # На плате НИЧЕГО не компилируется: в архиве уже лежат готовые
@@ -13,12 +13,12 @@
 #   headers/  — заголовки (на случай сборки других модулей на плате)
 #
 # Команды:
-#   ./deploy_ov9281.sh build <ИМЯ>    — собрать ядро + WiFi + упаковать
-#   ./deploy_ov9281.sh package        — упаковать отдельно (build уже делает это сама)
-#   ./deploy_ov9281.sh wifi           — только WiFi против уже собранного ядра + перепаковать
-#   ./deploy_ov9281.sh deploy <IP>    — ТОЛЬКО отправить готовое на плату
-#   ./deploy_ov9281.sh all <IP> <ИМЯ> — build, затем deploy, подряд
-#   ./deploy_ov9281.sh clean          — полная очистка (.config удаляется, .deb-кэш aic8800 остаётся)
+#   ./full_deploy_ov9281.sh build <ИМЯ>    — собрать ядро + WiFi + упаковать
+#   ./full_deploy_ov9281.sh package        — упаковать отдельно (build уже делает это сама)
+#   ./full_deploy_ov9281.sh wifi           — только WiFi против уже собранного ядра + перепаковать
+#   ./full_deploy_ov9281.sh deploy <IP>    — ТОЛЬКО отправить готовое на плату
+#   ./full_deploy_ov9281.sh all <IP> <ИМЯ> — build, затем deploy, подряд
+#   ./full_deploy_ov9281.sh clean          — полная очистка (.config удаляется, .deb-кэш aic8800 остаётся)
 #
 # На плате после deploy:
 #   sudo ./install_kernel.sh   — ядро + модули + WiFi + overlay + headers
@@ -26,12 +26,18 @@
 #
 set -e
 set -o pipefail
+set -E   # ERR-ловушка срабатывает и внутри функций
+
+SCRIPT_VERSION="2026-11-16 r5 (WiFi в архиве, проверка vermagic через objcopy)"
+
+# Любой неожиданный выход по set -e — НЕ молча, а с местом падения.
+trap 'rc=$?; echo "" >&2; echo "ОШИБКА: скрипт прерван (код $rc) в строке $LINENO: $BASH_COMMAND" >&2; echo "[$(date "+%H:%M:%S")] ОШИБКА: прерван (код $rc) строка $LINENO: $BASH_COMMAND" >> "${LOG:-full_deploy_ov9281.log}" 2>/dev/null; exit $rc' ERR
 
 ARCH=arm64
 CROSS_COMPILE=aarch64-linux-gnu-
 BOARD_USER=radxa
 CUR_DIR=$(pwd)
-LOG="deploy_ov9281.log"
+LOG="full_deploy_ov9281.log"
 PKG_PREFIX="ov9281"   # имя архива: ov9281-<версия>.tar.gz
 
 log()  { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
@@ -183,7 +189,7 @@ cmd_clean() {
     log "Очистка ядра (make clean + mrproper)..."
     run make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE clean || true
     run make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE mrproper || true
-    run rm -f .config .config.old .ov9281_kver deploy_ov9281.log
+    run rm -f .config .config.old .ov9281_kver full_deploy_ov9281.log
     ok "Ядро очищено (.config удалён — build сам возьмёт свежий из эталона)"
 
     log "Удаление архивов..."
@@ -518,7 +524,7 @@ cmd_package() {
     echo ""
     echo " ОТПРАВКА НА ПЛАТУ (одна из двух команд):"
     echo ""
-    echo "   ./deploy_ov9281.sh deploy $ip_hint"
+    echo "   ./full_deploy_ov9281.sh deploy $ip_hint"
     echo ""
     echo "   или вручную:"
     echo "   scp \"${PKG_PREFIX}-$kver.tar.gz\" install_kernel.sh $BOARD_USER@$ip_hint:~/"
@@ -559,7 +565,7 @@ cmd_deploy() {
 
     step "ОТПРАВКА НА ПЛАТУ $ip"
 
-    [[ -f "$CUR_DIR/install_kernel.sh" ]] || die "Не найден $CUR_DIR/install_kernel.sh рядом со скриптом deploy_ov9281.sh — он должен лежать в этой же папке."
+    [[ -f "$CUR_DIR/install_kernel.sh" ]] || die "Не найден $CUR_DIR/install_kernel.sh рядом со скриптом full_deploy_ov9281.sh — он должен лежать в этой же папке."
 
     local files_to_copy=(
         "$pkg"
@@ -624,7 +630,7 @@ cmd_all() {
 cmd_help() {
     cat << EOF
 ============================================================
-  DEPLOY_OV9281.SH — сборка ядра ROCK 4D (built-in OV9281)
+  FULL_DEPLOY_OV9281.SH — сборка ядра ROCK 4D (built-in OV9281)
 ============================================================
 
 WiFi (AIC8800 $AIC_VER) КРОСС-собирается здесь же, вместе с ядром,
@@ -672,6 +678,7 @@ EOF
 # ============================================
 # MAIN
 # ============================================
+echo "$(basename "$0") — версия скрипта: $SCRIPT_VERSION"
 case "${1:-}" in
     clean)   STEP_TOTAL=2; cmd_clean ;;
     build)   STEP_TOTAL=10; shift; cmd_build "$@" ;;
