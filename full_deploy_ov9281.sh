@@ -6,7 +6,7 @@
 # На плате НИЧЕГО не компилируется: в архиве уже лежат готовые
 # aic*_usb.ko и прошивка. install_wifi.sh больше не нужен (запасной вариант).
 #
-# Создаётся ОДИН архив wsl-ov9281-<версия>.tar.gz:
+# Создаётся ОДИН архив ov9281-<версия>.tar.gz:
 #   boot/     — Image + modules (вкл. updates/aic8800/*.ko) + dtb + overlay +
 #               config-plain + firmware/aic8800_fw/USB + aic8800.conf +
 #               live_auto_exposure.cpp
@@ -32,7 +32,7 @@ CROSS_COMPILE=aarch64-linux-gnu-
 BOARD_USER=radxa
 CUR_DIR=$(pwd)
 LOG="deploy_ov9281.log"
-PKG_PREFIX="wsl-ov9281"   # префикс архива: wsl- = собрано (кросс-компиляция) в WSL
+PKG_PREFIX="ov9281"   # имя архива: ov9281-<версия>.tar.gz
 
 log()  { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 err()  { echo "ОШИБКА: $*" >&2; echo "[$(date '+%H:%M:%S')] ОШИБКА: $*" >> "$LOG"; }
@@ -187,7 +187,7 @@ cmd_clean() {
     ok "Ядро очищено (.config удалён — build сам возьмёт свежий из эталона)"
 
     log "Удаление архивов..."
-    run rm -f ${PKG_PREFIX}-*.tar.gz ov9281-*.tar.gz
+    run rm -f ${PKG_PREFIX}-*.tar.gz
 
     log "Удаление временных файлов..."
     run rm -rf /tmp/modules_* /tmp/kernel_pkg_* /tmp/headers_* /tmp/ov9281_pkg_*
@@ -577,9 +577,9 @@ cmd_deploy() {
 
     # Старые архивы на плате ломают install_kernel.sh (мог взять не тот) —
     # переносим их в ~/ov9281_old/ (не удаляем).
-    log "Перенос старых *ov9281-*.tar.gz на плате в ~/ov9281_old/ ..."
+    log "Перенос старых ov9281-*.tar.gz на плате в ~/ov9281_old/ ..."
     run ssh -o ConnectTimeout=10 "$BOARD_USER@$ip" \
-        'mkdir -p ~/ov9281_old; for f in ~/ov9281-*.tar.gz ~/wsl-ov9281-*.tar.gz; do [ -e "$f" ] && mv -v "$f" ~/ov9281_old/; done; true' \
+        'mkdir -p ~/ov9281_old; for f in ~/ov9281-*.tar.gz; do [ -e "$f" ] && mv -v "$f" ~/ov9281_old/; done; true' \
         || warn "Не удалось почистить старые архивы на плате — проверьте ~ вручную"
 
     run scp -o ConnectTimeout=10 "${files_to_copy[@]}" "$BOARD_USER@$ip":~/ || die "Не удалось скопировать файлы"
@@ -661,7 +661,7 @@ drivers/media/i2c/ov9281.o перед полной сборкой Image+modules+
   ip -br link ; nmcli device wifi list
 
 Файлы:
-  wsl-ov9281-<версия>.tar.gz  — ОДИН архив: boot/ (Image+modules+WiFi+dtb+overlay+cpp)
+  ov9281-<версия>.tar.gz  — ОДИН архив: boot/ (Image+modules+WiFi+dtb+overlay+cpp)
                             + headers/
 
 Лог: $LOG
