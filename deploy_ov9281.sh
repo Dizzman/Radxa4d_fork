@@ -62,6 +62,33 @@ check_tree() {
     [[ -f Makefile ]] || die "Запустите из папки с ядром"
 }
 
+# Проверяет, что все host-инструменты сборки ядра РЕАЛЬНО ЗАПУСКАЮТСЯ
+# (а не просто "где-то лежат" — в WSL в PATH бывают недоступные
+# Windows-пути, и тогда make падает с "flex: Permission denied").
+check_host_deps() {
+    local missing=0 t
+    for t in flex bison bc make gcc perl openssl aarch64-linux-gnu-gcc; do
+        if ! "$t" --version &>/dev/null; then
+            warn "$t не запускается: $(type -a "$t" 2>&1 | head -3 | tr '\n' ' ')"
+            missing=1
+        fi
+    done
+    [[ -f /usr/include/openssl/ssl.h ]]  || { warn "нет заголовков libssl-dev"; missing=1; }
+    [[ -f /usr/include/libelf.h ]]       || { warn "нет заголовков libelf-dev"; missing=1; }
+
+    if [[ "$missing" -eq 1 ]]; then
+        log "Установка зависимостей сборки ядра..."
+        run sudo apt update
+        run sudo apt install -y flex bison bc make gcc perl openssl libssl-dev libelf-dev \
+            libncurses-dev dwarves cpio kmod rsync crossbuild-essential-arm64 gcc-aarch64-linux-gnu
+        hash -r
+        for t in flex bison bc aarch64-linux-gnu-gcc; do
+            "$t" --version &>/dev/null || die "$t по-прежнему не запускается. Проверьте: type -a $t ; echo \$PATH (недоступные /mnt/c/... пути можно убрать: в /etc/wsl.conf [interop] appendWindowsPath=false, затем 'wsl --shutdown')"
+        done
+    fi
+    ok "Host-инструменты сборки на месте (flex, bison, bc, gcc, aarch64-linux-gnu-gcc)"
+}
+
 # Всегда перезаписывает .config эталонным файлом (radxa4d.config /
 # radxa4d_config / rock4d.config — поддерживаются варианты именования).
 # ГАРАНТИРУЕТ сборку с заведомо чистого конфига, а не с версией .config,
@@ -117,11 +144,7 @@ cmd_build() {
     check_tree
     sync_config_from_reference
 
-    if ! command -v aarch64-linux-gnu-gcc &> /dev/null; then
-        log "Установка кросс-компилятора..."
-        run sudo apt update
-        run sudo apt install -y crossbuild-essential-arm64 gcc-aarch64-linux-gnu
-    fi
+    check_host_deps
 
     step "1.1 НАСТРОЙКА .config"
 
@@ -273,7 +296,7 @@ cmd_build() {
 
     step "ИТОГ СБОРКИ"
     ok "СБОРКА ЗАВЕРШЕНА! Версия: $kver"
-    log "Дальше: упаковка в 2 архива (boot + headers)..."
+    log "Дальше: упаковка в ОДИН архив (boot/ + headers/)..."
 
     cmd_package
 }
@@ -290,11 +313,28 @@ cmd_package() {
 
     step "УПАКОВКА В ОДИН АРХИВ (boot/ + headers/)"
 
+    command -v rsync &>/dev/null || { run sudo apt install -y rsync; }
+
+    # Остатки прошлых (в т.ч. упавших) упаковок
+    rm -rf /tmp/modules_* /tmp/ov9281_pkg_* /tmp/pkg_manifest_* 2>/dev/null || true
+
+    # Нужно места: модули (~1 ГБ с отладкой) + headers + архив. Требуем 4 ГБ
+    # свободных и в /tmp, и в папке с ядром — иначе WSL уйдёт в read-only.
+    local d free_kb
+    for d in /tmp "$CUR_DIR"; do
+        free_kb=$(df -Pk "$d" | awk 'NR==2{print $4}')
+        if [[ "$free_kb" -lt $((4*1024*1024)) ]]; then
+            df -h "$d"
+            die "В $d свободно меньше 4 ГБ ($((free_kb/1024)) МБ) — освободите место перед упаковкой"
+        fi
+    done
+    log "Свободно: /tmp — $(df -h /tmp | awk 'NR==2{print $4}'), $CUR_DIR — $(df -h "$CUR_DIR" | awk 'NR==2{print $4}')"
+
     log "Установка модулей ядра..."
     local modpath="/tmp/modules_$kver"
     run rm -rf "$modpath"
     run mkdir -p "$modpath"
-    run make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE INSTALL_MOD_PATH="$modpath" modules_install || die "Ошибка установки модулей"
+    run make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE INSTALL_MOD_PATH="$modpath" INSTALL_MOD_STRIP=1 modules_install || die "Ошибка установки модулей"
 
     local staging="/tmp/ov9281_pkg_$kver"
     run rm -rf "$staging"
@@ -324,12 +364,22 @@ cmd_package() {
     log "=== headers/ — заголовки для сборки WiFi на плате ==="
     run cp -a Makefile .config Module.symvers "$staging/headers/"
     run cp -a include "$staging/headers/"
+    # arch/arm64 — БЕЗ результатов сборки (.o/.a/.cmd/.ko/.dtb/Image и всего
+    # boot/). Иначе копируются гигабайты, диск WSL переполняется и
+    # переходит в read-only. Для сборки внешних модулей нужны только
+    # Makefile, include/ (в т.ч. include/generated) и исходники Kconfig/tools.
     run mkdir -p "$staging/headers/arch"
-    run cp -a arch/arm64 "$staging/headers/arch/"
+    run rsync -a \
+        --exclude='/arm64/boot/' \
+        --exclude='*.o' --exclude='*.a' --exclude='.*.cmd' --exclude='*.ko' \
+        --exclude='*.dtb' --exclude='*.dtbo' --exclude='*.mod' --exclude='*.mod.c' \
+        --exclude='*.lds' --exclude='modules.order' --exclude='*.so' --exclude='*.dbg' \
+        arch/arm64 "$staging/headers/arch/"
+    log "headers/arch/arm64: $(du -sh "$staging/headers/arch/arm64" | cut -f1)"
 
-    # scripts/ копируется КАК ЕСТЬ (x86-бинарники из WSL) — плата
-    # пересоберёт их сама, нативно, командой install_wifi.sh.
-    run cp -a scripts "$staging/headers/"
+    # scripts/ — исходники + x86-бинарники (плата пересоберёт их нативно
+    # в install_wifi.sh). Объектные файлы не нужны.
+    run rsync -a --exclude='*.o' --exclude='.*.cmd' scripts "$staging/headers/"
 
     # scripts/sorttable.c включает <tools/be_byteshift.h> — без каталога
     # tools/include пересборка 'scripts' на плате упадёт с "No such file".
@@ -353,6 +403,18 @@ cmd_package() {
     head -60 /tmp/pkg_manifest_$kver.txt
     log "Всего файлов в архиве: $(wc -l < /tmp/pkg_manifest_$kver.txt) (полный список — в $LOG)"
 
+    # Самопроверка архива: именно это проверяет install_kernel.sh на плате.
+    tar tzf "$CUR_DIR/ov9281-$kver.tar.gz" > /tmp/pkg_names_$kver.txt
+    local need
+    for need in "./boot/Image" "./boot/config-plain" "./boot/overlay.dts" \
+                "./boot/lib/modules/$kver/modules.dep" \
+                "./headers/kernel.release" "./headers/Module.symvers" "./headers/.config"; do
+        grep -qxF "$need" /tmp/pkg_names_$kver.txt || die "В архиве НЕТ $need — архив неполный, на плату не отправлять!"
+    done
+    [[ -s Module.symvers ]] || die "Module.symvers пустой — WiFi-модуль на плате не загрузится"
+    rm -f /tmp/pkg_names_$kver.txt
+    ok "Архив проверен: boot/Image, modules/$kver, overlay, headers/ — на месте"
+
     if grep -qi "^\./boot/.*ov9281" /tmp/pkg_manifest_$kver.txt; then
         warn "Внимание: в boot/ НАЙДЕНО что-то с именем ov9281 — это НЕ ожидалось (ov9281 должен быть built-in внутри Image, не отдельным файлом). Проверьте вручную:"
         grep -i "^\./boot/.*ov9281" /tmp/pkg_manifest_$kver.txt
@@ -364,6 +426,29 @@ cmd_package() {
     run rm -rf "$modpath" "$staging"
 
     step "УПАКОВКА ЗАВЕРШЕНА"
+
+    # IP платы: последний использованный в deploy (если был), иначе <IP>
+    local ip_hint="<IP>"
+    [[ -f "$CUR_DIR/.ov9281_last_ip" ]] && ip_hint=$(cat "$CUR_DIR/.ov9281_last_ip")
+
+    echo "============================================================"
+    echo " АРХИВ ГОТОВ: ov9281-$kver.tar.gz ($(du -h "$CUR_DIR/ov9281-$kver.tar.gz" | cut -f1))"
+    echo ""
+    echo " ОТПРАВКА НА ПЛАТУ (одна из двух команд):"
+    echo ""
+    echo "   ./deploy_ov9281.sh deploy $ip_hint"
+    echo ""
+    echo "   или вручную:"
+    echo "   scp \"ov9281-$kver.tar.gz\" install_kernel.sh install_wifi.sh $BOARD_USER@$ip_hint:~/"
+    echo ""
+    echo " НА ПЛАТЕ:"
+    echo "   ssh $BOARD_USER@$ip_hint"
+    echo "   chmod +x install_kernel.sh install_wifi.sh"
+    echo "   sudo ./install_kernel.sh"
+    echo "   sudo reboot"
+    echo "   uname -r                 (ожидается: $kver)"
+    echo "   sudo ./install_wifi.sh"
+    echo "============================================================"
 }
 
 # ============================================
@@ -377,6 +462,7 @@ cmd_deploy() {
     local kver
     kver=$(cat .ov9281_kver)
     log "Версия: $kver"
+    echo "$ip" > "$CUR_DIR/.ov9281_last_ip"
 
     local pkg="$CUR_DIR/ov9281-$kver.tar.gz"
     [[ -f "$pkg" ]] || die "Не найден $pkg — сначала выполните: $0 build <ИМЯ>"
@@ -400,7 +486,21 @@ cmd_deploy() {
     done
     echo ""
 
+    # Старые архивы на плате ломают install_kernel.sh (мог взять не тот) —
+    # переносим их в ~/ov9281_old/ (не удаляем).
+    log "Перенос старых ov9281-*.tar.gz на плате в ~/ov9281_old/ ..."
+    run ssh -o ConnectTimeout=10 "$BOARD_USER@$ip" \
+        'mkdir -p ~/ov9281_old; for f in ~/ov9281-*.tar.gz; do [ -e "$f" ] && mv -v "$f" ~/ov9281_old/; done; true' \
+        || warn "Не удалось почистить старые архивы на плате — проверьте ~ вручную"
+
     run scp -o ConnectTimeout=10 "${files_to_copy[@]}" "$BOARD_USER@$ip":~/ || die "Не удалось скопировать файлы"
+
+    log "Проверка размера архива на плате..."
+    local remote_size local_size
+    local_size=$(stat -c %s "$pkg")
+    remote_size=$(ssh -o ConnectTimeout=10 "$BOARD_USER@$ip" "stat -c %s ~/$(basename "$pkg")" 2>/dev/null || echo 0)
+    [[ "$local_size" == "$remote_size" ]] || die "Размер архива на плате ($remote_size) ≠ локальному ($local_size) — передача оборвалась"
+    ok "Архив на плате целый ($local_size байт)"
 
     echo ""
     echo "============================================================"
