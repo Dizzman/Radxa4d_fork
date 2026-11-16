@@ -14,9 +14,115 @@
 #   sudo ./install_kernel.sh ov9281-<версия>.tar.gz  — взять указанный архив
 #
 set -e
+set -E
+NEW_KERNEL_COPIED=0
+on_err() {
+    local rc=$1 line=$2 cmd=$3
+    echo "" >&2
+    echo "ОШИБКА: install_kernel.sh прерван (код $rc) в строке $line: $cmd" >&2
+    if [[ "$NEW_KERNEL_COPIED" -eq 1 ]] && declare -F pin_boot_default &>/dev/null; then
+        echo "→ установка не завершена: закрепляю загрузку СТАРОГО ядра $OLD_KVER" >&2
+        pin_boot_default "$OLD_KVER" >&2 || true
+    fi
+    exit "$rc"
+}
+trap 'on_err $? $LINENO "$BASH_COMMAND"' ERR
 
 run() { echo "+ $*"; "$@"; }
-die() { echo "ОШИБКА: $*" >&2; [[ -n "${STAGE:-}" ]] && rm -rf "$STAGE"; exit 1; }
+# Ошибки, которые не прерывают установку сразу, но ЗАПРЕЩАЮТ делать новое
+# ядро загрузочным по умолчанию.
+ERRORS=()
+add_err() { ERRORS+=("$*"); echo "❌ $*" >&2; }
+
+die() {
+    echo "ОШИБКА: $*" >&2
+    [[ -n "${STAGE:-}" ]] && rm -rf "$STAGE"
+    # Если уже начали ставить новое ядро — закрепить загрузку старого
+    [[ "${NEW_KERNEL_COPIED:-0}" -eq 1 ]] && declare -F pin_boot_default &>/dev/null && \
+        { echo "→ закрепляю загрузку СТАРОГО ядра $OLD_KVER" >&2; pin_boot_default "$OLD_KVER" >&2 || true; }
+    exit 1
+}
+
+# ---------------- загрузчик (u-boot-menu / extlinux) ----------------
+EXTLINUX=/boot/extlinux/extlinux.conf
+UBOOT_CFG=/etc/default/u-boot
+if [[ ! -f "$EXTLINUX" ]]; then
+    _alt=$(find /boot -name extlinux.conf 2>/dev/null | head -1 || true)
+    [[ -n "$_alt" ]] && EXTLINUX="$_alt"
+fi
+
+# Метка (l0, l1, ...) пункта меню с vmlinuz-<версия> (не rescue).
+# Сравнение строк, без regex — в версии бывает '+'.
+find_label() {
+    [[ -f "$EXTLINUX" ]] || return 0
+    awk -v k="vmlinuz-$1" '
+        { c=tolower($1) }
+        c=="label" { l=$2 }
+        (c=="linux" || c=="kernel") && substr($2, length($2)-length(k)+1)==k && l !~ /r$/ { print l; exit }
+    ' "$EXTLINUX"
+}
+# Версия ядра, которую грузит пункт по умолчанию (из строки linux .../vmlinuz-<версия>)
+default_version() {
+    [[ -f "$EXTLINUX" ]] || return 0
+    awk -v d="$(current_default)" '
+        { c=tolower($1) }
+        c=="label" { l=$2 }
+        (c=="linux" || c=="kernel") && l==d { n=$2; sub(/.*vmlinuz-/, "", n); sub(/.*Image-/, "", n); print n; exit }
+    ' "$EXTLINUX"
+}
+current_default() { [[ -f "$EXTLINUX" ]] && awk 'tolower($1)=="default"{print $2; exit}' "$EXTLINUX" || true; }
+show_menu() {
+    echo "--- меню загрузки $EXTLINUX ---"
+    awk '{c=tolower($1)} c=="default"{print "  default " $2} c=="label"{l=$2} c=="linux"||c=="kernel"{print "  " l "\t" $2}' "$EXTLINUX"
+    echo "-------------------------------------------"
+}
+
+# pin_boot_default <версия> — сделать пункт с этой версией загрузочным по
+# умолчанию и ПРОВЕРИТЬ. 0 = выставлено и проверено.
+pin_boot_default() {
+    local ver="$1" label def
+    local have_ubu=0
+    command -v u-boot-update &>/dev/null && have_ubu=1
+    [[ $have_ubu -eq 1 ]] && u-boot-update >/dev/null
+    [[ -f "$EXTLINUX" ]] || { echo "⚠  $EXTLINUX не найден"; return 1; }
+    label=$(find_label "$ver")
+    [[ -n "$label" ]] || { echo "⚠  в $EXTLINUX нет пункта с vmlinuz-$ver"; return 1; }
+
+    # Способ 1 (постоянный): U_BOOT_DEFAULT
+    if [[ $have_ubu -eq 1 ]]; then
+    [[ -f "$UBOOT_CFG" ]] || touch "$UBOOT_CFG"
+    if grep -qE '^#?[[:space:]]*U_BOOT_DEFAULT=' "$UBOOT_CFG"; then
+        sed -i -E "s|^#?[[:space:]]*U_BOOT_DEFAULT=.*|U_BOOT_DEFAULT=\"$label\"|" "$UBOOT_CFG"
+    else
+        echo "U_BOOT_DEFAULT=\"$label\"" >> "$UBOOT_CFG"
+    fi
+    if [[ -d /usr/share/u-boot-menu/conf.d || -d /etc/u-boot-menu ]]; then
+        mkdir -p /etc/u-boot-menu/conf.d
+        echo "U_BOOT_DEFAULT=\"$label\"" > /etc/u-boot-menu/conf.d/99-ov9281-default.conf
+    fi
+    u-boot-update >/dev/null
+    label=$(find_label "$ver"); def=$(current_default)
+    if [[ -n "$label" && "$def" == "$label" ]]; then
+        echo "✅ по умолчанию '$def' → vmlinuz-$ver (U_BOOT_DEFAULT)"
+        return 0
+    fi
+    fi
+
+    # Способ 2 (запасной): прямая правка строки default
+    echo "⚠  u-boot-update оставил default='$def' (нужно '$label') — правлю $EXTLINUX напрямую"
+    if grep -qiE '^[[:space:]]*default[[:space:]]' "$EXTLINUX"; then
+        sed -i -E "0,/^[[:space:]]*[Dd][Ee][Ff][Aa][Uu][Ll][Tt][[:space:]]/s|^[[:space:]]*[Dd][Ee][Ff][Aa][Uu][Ll][Tt][[:space:]].*|default $label|" "$EXTLINUX"
+    else
+        sed -i "1i default $label" "$EXTLINUX"
+    fi
+    def=$(current_default)
+    if [[ "$def" == "$label" ]]; then
+        echo "✅ по умолчанию '$def' → vmlinuz-$ver (прямая правка; после следующего u-boot-update проверьте: grep ^default $EXTLINUX)"
+        return 0
+    fi
+    echo "⚠  не удалось выставить default='$label' (сейчас '$def')"
+    return 1
+}
 
 [[ $EUID -eq 0 ]] || die "Запустите через sudo: sudo $0 $*"
 
@@ -56,7 +162,7 @@ else
             echo "   [СТАРЫЙ] $f  — нет boot/+headers/, пропускаю"
         fi
     done
-    [[ -n "$PKG" ]] || die "ни один архив не имеет формата boot/+headers/. Пересоберите: ./deploy_ov9281.sh build <ИМЯ> и заново deploy."
+    [[ -n "$PKG" ]] || die "ни один архив не имеет формата boot/+headers/. Пересоберите: ./full_deploy_ov9281.sh build <ИМЯ> и заново deploy."
     if [[ ${#CANDIDATES[@]} -gt 1 ]]; then
         echo "⚠  Архивов несколько — беру самый свежий подходящий. Старые лучше удалить:"
         echo "     mkdir -p ~/ov9281_old && mv ~/ov9281-*.tar.gz ~/ov9281_old/   (кроме нужного)"
@@ -111,6 +217,7 @@ echo "Бэкап: $BACKUP_DIR"
 echo ""
 echo "=== [4/7] Установка ядра, dtb, модулей (из boot/) ==="
 run cp "$STAGE/boot/Image" "/boot/vmlinuz-${KVER}"
+NEW_KERNEL_COPIED=1
 echo "✅ vmlinuz-${KVER}"
 
 run mkdir -p "/usr/lib/linux-image-${KVER}/rockchip"
@@ -118,7 +225,7 @@ if ls "$STAGE/boot"/rk3576-rock-4d*.dtb &>/dev/null; then
     run cp "$STAGE/boot"/rk3576-rock-4d*.dtb "/usr/lib/linux-image-${KVER}/rockchip/"
     echo "✅ dtb"
 else
-    echo "⚠  dtb rk3576-rock-4d*.dtb в архиве нет — загрузчик возьмёт dtb по умолчанию"
+    add_err "dtb rk3576-rock-4d*.dtb нет в архиве"
 fi
 
 run mkdir -p "/lib/modules/${KVER}"
@@ -172,13 +279,16 @@ echo "✅ WiFi AIC8800 установлен — заработает после 
 echo ""
 echo "=== [6/7] Overlay камеры OV9281 (из boot/) ==="
 if [[ -f "$STAGE/boot/overlay.dts" ]]; then
-    run dtc -@ -I dts -O dtb -o /tmp/rock-4d-ov9281.dtbo "$STAGE/boot/overlay.dts"
-    run mkdir -p /boot/dtbo
-    run cp /tmp/rock-4d-ov9281.dtbo /boot/dtbo/rock-4d-ov9281.dtbo
-    echo "✅ Overlay установлен: /boot/dtbo/rock-4d-ov9281.dtbo"
-    mv /boot/dtbo/rock-4d-rpi-camera-v1_3.dtbo /boot/dtbo/rock-4d-rpi-camera-v1_3.dtbo.disabled 2>/dev/null || true
+    if run dtc -@ -I dts -O dtb -o /tmp/rock-4d-ov9281.dtbo "$STAGE/boot/overlay.dts"; then
+        run mkdir -p /boot/dtbo
+        run cp /tmp/rock-4d-ov9281.dtbo /boot/dtbo/rock-4d-ov9281.dtbo
+        echo "✅ Overlay установлен: /boot/dtbo/rock-4d-ov9281.dtbo"
+        mv /boot/dtbo/rock-4d-rpi-camera-v1_3.dtbo /boot/dtbo/rock-4d-rpi-camera-v1_3.dtbo.disabled 2>/dev/null || true
+    else
+        add_err "dtc не смог скомпилировать overlay.dts"
+    fi
 else
-    echo "ОШИБКА: overlay.dts не найден в boot/ — камера работать не будет!"
+    add_err "overlay.dts не найден в архиве — камера работать не будет"
 fi
 
 if [[ -f "$STAGE/boot/live_auto_exposure.cpp" ]]; then
@@ -194,7 +304,7 @@ run mkdir -p "$HEADERS_DIR"
 run cp -a "$STAGE/headers/." "$HEADERS_DIR/"
 run ln -sfn "$HEADERS_DIR" "/lib/modules/${KVER}/build"
 run ln -sfn "$HEADERS_DIR" "/lib/modules/${KVER}/source"
-[[ -s "$HEADERS_DIR/Module.symvers" ]] || echo "⚠  $HEADERS_DIR/Module.symvers пустой/отсутствует — WiFi-модуль может не загрузиться"
+[[ -s "$HEADERS_DIR/Module.symvers" ]] || echo "⚠  $HEADERS_DIR/Module.symvers пустой/отсутствует (нужен только для сборки других модулей на плате)"
 echo "✅ Заголовки распакованы в $HEADERS_DIR"
 echo "   (scripts/ — x86 из WSL; для сборки ДРУГИХ модулей на плате запустите install_wifi.sh, он пересоберёт их)"
 
@@ -202,18 +312,42 @@ run rm -rf "$STAGE"
 STAGE=""
 
 echo ""
-echo "=== initramfs и загрузчик ==="
-run update-initramfs -c -k "$KVER"
-echo "✅ initramfs"
-
-if command -v u-boot-update &> /dev/null; then
-    run u-boot-update
-    echo "✅ загрузчик обновлён"
+echo "=== initramfs ==="
+if [[ -f "/boot/initrd.img-$KVER" ]]; then
+    INITRD_CMD=(update-initramfs -u -k "$KVER")   # уже есть (повторная установка) — обновить
+else
+    INITRD_CMD=(update-initramfs -c -k "$KVER")   # первая установка — создать
 fi
+if run "${INITRD_CMD[@]}"; then
+    echo "✅ initramfs"
+else
+    add_err "update-initramfs завершился с ошибкой"
+fi
+
+# --- ИТОГОВАЯ ПРОВЕРКА установленного ------------------------------------------
+echo ""
+echo "=== Проверка установки $KVER ==="
+CRIT=()   # без этого новое ядро НЕ загрузится → default не переключаем
+chk() {   # chk crit|warn "<описание>" <команда...>
+    local lvl="$1" what="$2"; shift 2
+    if "$@" &>/dev/null; then echo "✅ $what"; return; fi
+    add_err "$what — НЕ OK"
+    [[ "$lvl" == crit ]] && CRIT+=("$what")
+}
+chk crit "ядро /boot/vmlinuz-$KVER"                  test -s "/boot/vmlinuz-$KVER"
+chk crit "initramfs /boot/initrd.img-$KVER"          test -s "/boot/initrd.img-$KVER"
+chk crit "модули /lib/modules/$KVER/modules.dep"     test -s "/lib/modules/$KVER/modules.dep"
+chk crit "dtb в /usr/lib/linux-image-$KVER/rockchip" bash -c "ls /usr/lib/linux-image-$KVER/rockchip/rk3576-rock-4d*.dtb"
+chk warn "overlay /boot/dtbo/rock-4d-ov9281.dtbo"    test -s /boot/dtbo/rock-4d-ov9281.dtbo
+for m in aic_load_fw_usb aic8800_fdrv_usb aic_btusb_usb; do
+    chk warn "WiFi-модуль $m виден для $KVER"        modinfo -k "$KVER" -n "$m"
+done
+chk warn "прошивка /lib/firmware/aic8800_fw/USB"     test -n "$(ls -A /lib/firmware/aic8800_fw/USB 2>/dev/null)"
+chk warn "автозагрузка /etc/modules-load.d/aic8800.conf" test -s /etc/modules-load.d/aic8800.conf
 
 echo ""
 echo "============================================================"
-echo " УСТАНОВКА ЗАВЕРШЕНА"
+[[ ${#ERRORS[@]} -eq 0 ]] && echo " УСТАНОВКА ЗАВЕРШЕНА — ОШИБОК НЕТ" || echo " УСТАНОВКА ЗАВЕРШЕНА С ОШИБКАМИ (${#ERRORS[@]})"
 echo ""
 echo " Архив:          $PKG"
 echo " Новое ядро:     $KVER"
@@ -221,14 +355,124 @@ echo " OV9281 overlay: /boot/dtbo/rock-4d-ov9281.dtbo"
 echo " WiFi AIC8800:   /lib/modules/$KVER/updates/aic8800 (готовые модули)"
 echo " Заголовки:      $HEADERS_DIR"
 echo ""
-echo " Метку загрузки по умолчанию нужно выставить вручную:"
-echo "   grep -B1 'menu label.*$KVER' /boot/extlinux/extlinux.conf"
-echo "   sudo sed -i 's/^#\\?U_BOOT_DEFAULT=.*/U_BOOT_DEFAULT=\"<label>\"/' /etc/default/u-boot"
-echo "   sudo u-boot-update"
+if [[ ${#ERRORS[@]} -gt 0 ]]; then
+    echo ""
+    echo " ОШИБКИ (${#ERRORS[@]}):"
+    for e in "${ERRORS[@]}"; do echo "   ❌ $e"; done
+    echo " Исправьте и при необходимости запустите install_kernel.sh снова."
+fi
+echo " Откат на старое ядро ($OLD_KVER): выбрать его в меню U-Boot при старте"
+echo "   или вернуть /etc/default/u-boot из $BACKUP_DIR/u-boot.default и sudo u-boot-update"
 echo ""
-echo " ДАЛЬШЕ:"
-echo "   sudo reboot"
-echo "   uname -r                    (ожидается: $KVER)"
-echo "   ip -br link                 (должен появиться wl*-интерфейс)"
-echo "   nmcli device wifi list"
 echo "============================================================"
+
+# =============================================================================
+# ПОСЛЕДНИЙ ШАГ: DEFAULT → НОВОЕ ЯДРО, (опц.) ОЧИСТКА СТАРЫХ, ПРОВЕРКА, ВЫВОД
+# =============================================================================
+
+# Все версии ядер, видимые загрузчику (/boot/vmlinuz-*)
+list_kernels() { ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|^/boot/vmlinuz-||' | sort -V; }
+
+# remove_kernel <версия> — удалить ядро целиком (через apt, если оно из пакета)
+remove_kernel() {
+    local v="$1" pkgs
+    pkgs=$(dpkg -S "/boot/vmlinuz-$v" "/lib/modules/$v" "/usr/src/linux-headers-$v" 2>/dev/null \
+           | cut -d: -f1 | tr ',' '\n' | sed 's/^ *//' | sort -u | tr '\n' ' ' || true)
+    if [[ -n "${pkgs// /}" ]]; then
+        echo "  → $v из пакетов: $pkgs— удаляю через apt"
+        # shellcheck disable=SC2086
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y $pkgs || echo "  ⚠ apt не смог удалить $pkgs"
+    fi
+    rm -f  "/boot/vmlinuz-$v" "/boot/initrd.img-$v" "/boot/config-$v" "/boot/System.map-$v"
+    rm -rf "/lib/modules/$v" "/usr/lib/linux-image-$v" "/usr/src/linux-headers-$v"
+    echo "  ✅ удалено: $v"
+}
+
+echo ""
+echo "################################################################"
+echo "###  ЗАГРУЗЧИК: новое ядро $KVER по умолчанию"
+echo "################################################################"
+cp "$UBOOT_CFG" "$BACKUP_DIR/u-boot.default" 2>/dev/null || true
+cp "$EXTLINUX"  "$BACKUP_DIR/extlinux.conf.before" 2>/dev/null || true
+
+BEFORE_LABEL=$(current_default); BEFORE_VER=$(default_version)
+echo "ДО настройки:    по умолчанию грузится ${BEFORE_VER:-не определено}  (label '${BEFORE_LABEL:-?}')"
+[[ -f "$EXTLINUX" ]] && show_menu
+
+if [[ ${#CRIT[@]} -gt 0 ]]; then
+    echo "❌ Новое ядро НЕ загрузится — не хватает: ${CRIT[*]}"
+    echo "   default НЕ переключаю, закрепляю текущее ядро $OLD_KVER. Очистку НЕ предлагаю."
+    pin_boot_default "$OLD_KVER" || true
+else
+    pin_boot_default "$KVER" || true
+
+    # ---------- Вопрос: оставить только текущую + новую систему ----------
+    KEEP=("$OLD_KVER" "$KVER")
+    TO_REMOVE=()
+    for v in $(list_kernels); do
+        [[ "$v" == "$OLD_KVER" || "$v" == "$KVER" ]] || TO_REMOVE+=("$v")
+    done
+
+    echo ""
+    echo "================================================================"
+    echo "  ОЧИСТКА МЕНЮ ЗАГРУЗКИ"
+    echo "  Останутся две системы:"
+    echo "     $OLD_KVER   (текущая, запущена сейчас)"
+    [[ "$KVER" != "$OLD_KVER" ]] && echo "     $KVER   (новая, по умолчанию)"
+    echo "  + убираются rescue-пункты (l0r, l1r ...)"
+    if [[ ${#TO_REMOVE[@]} -gt 0 ]]; then
+        echo "  Будут УДАЛЕНЫ ядра (vmlinuz, initrd, модули, dtb, заголовки):"
+        for v in "${TO_REMOVE[@]}"; do echo "     ❌ $v"; done
+    else
+        echo "  Других ядер нет — удалять нечего, только rescue-пункты."
+    fi
+    echo "================================================================"
+
+    ANSWER=""
+    if [[ -r /dev/tty ]]; then
+        read -r -p "  Очистить всё, кроме этих двух систем? [Yes/No]: " ANSWER < /dev/tty || ANSWER=""
+    else
+        echo "  (нет терминала — ответ по умолчанию: No)"
+    fi
+
+    case "${ANSWER,,}" in
+        y|yes|д|да)
+            echo "→ Yes: очищаю"
+            for v in "${TO_REMOVE[@]}"; do remove_kernel "$v"; done
+            # убрать rescue-пункты: только основной пункт для каждого ядра
+            [[ -f "$UBOOT_CFG" ]] || touch "$UBOOT_CFG"
+            if grep -qE '^#?[[:space:]]*U_BOOT_ALTERNATIVES=' "$UBOOT_CFG"; then
+                sed -i -E 's|^#?[[:space:]]*U_BOOT_ALTERNATIVES=.*|U_BOOT_ALTERNATIVES="default"|' "$UBOOT_CFG"
+            else
+                echo 'U_BOOT_ALTERNATIVES="default"' >> "$UBOOT_CFG"
+            fi
+            [[ -d /etc/u-boot-menu/conf.d ]] && echo 'U_BOOT_ALTERNATIVES="default"' >> /etc/u-boot-menu/conf.d/99-ov9281-default.conf
+            # метки после очистки сдвинулись — заново выставить новое ядро
+            pin_boot_default "$KVER" || true
+            ;;
+        *)
+            echo "→ No: ничего не удаляю"
+            ;;
+    esac
+fi
+
+AFTER_LABEL=$(current_default); AFTER_VER=$(default_version)
+echo ""
+[[ -f "$EXTLINUX" ]] && show_menu
+echo ""
+echo "================================================================"
+echo "  ДО настройки:     ${BEFORE_VER:-не определено}   (label '${BEFORE_LABEL:-?}')"
+echo "  ПОСЛЕ настройки:  ${AFTER_VER:-не определено}   (label '${AFTER_LABEL:-?}')"
+echo "  файл загрузчика:  $EXTLINUX"
+if [[ "$AFTER_VER" == "$KVER" ]]; then
+    echo "  ✅ по умолчанию грузится НОВОЕ ядро — после reboot: uname -r = $KVER"
+    echo "     sudo reboot"
+    echo "================================================================"
+    [[ ${#ERRORS[@]} -eq 0 ]] || exit 2
+    exit 0
+else
+    echo "  ❌ по умолчанию грузится НЕ новое ядро ($KVER)"
+    echo "     бэкап загрузчика: $BACKUP_DIR"
+    echo "================================================================"
+    exit 3
+fi
