@@ -14,6 +14,8 @@
 #   sudo ./install_kernel.sh ov9281-<версия>.tar.gz  — взять указанный архив
 #
 set -e
+set -E
+trap 'rc=$?; echo "" >&2; echo "ОШИБКА: install_kernel.sh прерван (код $rc) в строке $LINENO: $BASH_COMMAND" >&2; exit $rc' ERR
 
 run() { echo "+ $*"; "$@"; }
 die() { echo "ОШИБКА: $*" >&2; [[ -n "${STAGE:-}" ]] && rm -rf "$STAGE"; exit 1; }
@@ -203,12 +205,95 @@ STAGE=""
 
 echo ""
 echo "=== initramfs и загрузчик ==="
-run update-initramfs -c -k "$KVER"
+if [[ -f "/boot/initrd.img-$KVER" ]]; then
+    run update-initramfs -u -k "$KVER"      # уже есть (повторная установка) — обновить
+else
+    run update-initramfs -c -k "$KVER"      # первая установка — создать
+fi
+[[ -s "/boot/initrd.img-$KVER" ]] || die "initramfs /boot/initrd.img-$KVER не создан"
 echo "✅ initramfs"
 
-if command -v u-boot-update &> /dev/null; then
+# --- Загрузчик: НОВОЕ ЯДРО ПО УМОЛЧАНИЮ --------------------------------------
+echo ""
+echo "=== Загрузчик: новое ядро $KVER по умолчанию ==="
+EXTLINUX=/boot/extlinux/extlinux.conf
+UBOOT_CFG=/etc/default/u-boot
+
+# Метка (l0, l1, ...) пункта меню, который грузит vmlinuz-$KVER (не rescue).
+# Сравнение строк, без regex — в версии есть '+'.
+find_label() {
+    awk -v k="vmlinuz-$KVER" '
+        $1=="label" { l=$2 }
+        $1=="linux" && substr($2, length($2)-length(k)+1)==k && l !~ /r$/ { print l; exit }
+    ' "$EXTLINUX"
+}
+current_default() {
+    awk '$1=="default"{print $2; exit}' "$EXTLINUX"
+}
+show_menu() {
+    echo "--- пункты меню $EXTLINUX ---"
+    awk '$1=="default"{print "  default " $2} $1=="label"{l=$2} $1=="linux"{print "  " l "\t" $2}' "$EXTLINUX"
+    echo "-----------------------------------------------"
+}
+
+BOOT_DEFAULT_OK=0
+if command -v u-boot-update &>/dev/null; then
     run u-boot-update
-    echo "✅ загрузчик обновлён"
+    [[ -f "$EXTLINUX" ]] || die "после u-boot-update нет $EXTLINUX"
+    LABEL=$(find_label)
+    if [[ -z "$LABEL" ]]; then
+        show_menu
+        die "в $EXTLINUX нет пункта с vmlinuz-$KVER — загрузчик не увидел новое ядро"
+    fi
+    echo "Новое ядро в меню: пункт '$LABEL'"
+
+    # Где ещё задаётся U_BOOT_DEFAULT (может перебивать /etc/default/u-boot)
+    OTHER_DEF=$(grep -rlE '^[[:space:]]*U_BOOT_DEFAULT=' /usr/share/u-boot-menu /etc/u-boot-menu 2>/dev/null || true)
+    [[ -n "$OTHER_DEF" ]] && echo "ℹ  U_BOOT_DEFAULT задаётся также в: $OTHER_DEF"
+
+    # Способ 1 (постоянный): U_BOOT_DEFAULT в /etc/default/u-boot
+    [[ -f "$UBOOT_CFG" ]] || touch "$UBOOT_CFG"
+    run cp "$UBOOT_CFG" "$BACKUP_DIR/u-boot.default"
+    if grep -qE '^#?[[:space:]]*U_BOOT_DEFAULT=' "$UBOOT_CFG"; then
+        run sed -i -E "s|^#?[[:space:]]*U_BOOT_DEFAULT=.*|U_BOOT_DEFAULT=\"$LABEL\"|" "$UBOOT_CFG"
+    else
+        echo "U_BOOT_DEFAULT=\"$LABEL\"" >> "$UBOOT_CFG"
+    fi
+    # Если есть conf.d u-boot-menu — продублируем туда (на образах, где он
+    # читается ПОСЛЕ /etc/default/u-boot и перебивает его)
+    if [[ -d /usr/share/u-boot-menu/conf.d || -d /etc/u-boot-menu ]]; then
+        run mkdir -p /etc/u-boot-menu/conf.d
+        echo "U_BOOT_DEFAULT=\"$LABEL\"" > /etc/u-boot-menu/conf.d/99-ov9281-default.conf
+    fi
+    run u-boot-update
+
+    LABEL=$(find_label)
+    DEFAULT=$(current_default)
+    if [[ -n "$LABEL" && "$DEFAULT" == "$LABEL" ]]; then
+        BOOT_DEFAULT_OK=1
+        echo "✅ загрузчик: по умолчанию '$DEFAULT' → vmlinuz-$KVER (через U_BOOT_DEFAULT)"
+    else
+        # Способ 2 (запасной): прямо правим 'default' в extlinux.conf.
+        # Работает сразу, но следующий u-boot-update может вернуть как было.
+        echo "⚠  u-boot-update оставил default='$DEFAULT' (нужно '$LABEL') — правлю $EXTLINUX напрямую"
+        run cp "$EXTLINUX" "$BACKUP_DIR/extlinux.conf.before"
+        if grep -q '^default ' "$EXTLINUX"; then
+            run sed -i -E "s|^default .*|default $LABEL|" "$EXTLINUX"
+        else
+            run sed -i "1i default $LABEL" "$EXTLINUX"
+        fi
+        DEFAULT=$(current_default)
+        if [[ "$DEFAULT" == "$LABEL" ]]; then
+            BOOT_DEFAULT_OK=1
+            echo "✅ загрузчик: по умолчанию '$DEFAULT' → vmlinuz-$KVER (прямая правка extlinux.conf)"
+            echo "   ⚠ после следующего 'u-boot-update' проверьте: grep ^default $EXTLINUX"
+        fi
+    fi
+    show_menu
+    echo "   (бэкап /etc/default/u-boot и extlinux.conf: $BACKUP_DIR)"
+    [[ "$BOOT_DEFAULT_OK" -eq 1 ]] || die "не удалось выставить $KVER по умолчанию — пришлите вывод выше"
+else
+    echo "⚠  u-boot-update не найден — ядро по умолчанию НЕ выставлено"
 fi
 
 echo ""
@@ -221,10 +306,13 @@ echo " OV9281 overlay: /boot/dtbo/rock-4d-ov9281.dtbo"
 echo " WiFi AIC8800:   /lib/modules/$KVER/updates/aic8800 (готовые модули)"
 echo " Заголовки:      $HEADERS_DIR"
 echo ""
-echo " Метку загрузки по умолчанию нужно выставить вручную:"
-echo "   grep -B1 'menu label.*$KVER' /boot/extlinux/extlinux.conf"
-echo "   sudo sed -i 's/^#\\?U_BOOT_DEFAULT=.*/U_BOOT_DEFAULT=\"<label>\"/' /etc/default/u-boot"
-echo "   sudo u-boot-update"
+if [[ "$BOOT_DEFAULT_OK" -eq 1 ]]; then
+    echo " Загрузка:       по умолчанию НОВОЕ ядро ($KVER)"
+else
+    echo " Загрузка:       ⚠ ядро по умолчанию НЕ выставлено — см. предупреждение выше"
+fi
+echo " Откат на старое ядро ($OLD_KVER): выбрать его в меню U-Boot при старте"
+echo "   или вернуть /etc/default/u-boot из $BACKUP_DIR/u-boot.default и sudo u-boot-update"
 echo ""
 echo " ДАЛЬШЕ:"
 echo "   sudo reboot"
