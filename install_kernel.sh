@@ -4,8 +4,10 @@
 # ov9281-<версия>.tar.gz (внутри — подпапки boot/ и headers/):
 #   - новое ядро (Image → vmlinuz, modules, dtb) — из boot/
 #   - overlay камеры OV9281 (компилирует .dts → .dtbo и устанавливает) — из boot/
-#   - распаковывает заголовки (БЕЗ компиляции scripts — это делает
-#     отдельный install_wifi.sh, после reboot) — из headers/
+#   - WiFi-драйвер AIC8800 4.0 — ОТДЕЛЬНЫЙ ШАГ [5/7]: готовые .ko в
+#     /lib/modules/<версия>/updates/aic8800, прошивка в /lib/firmware/aic8800_fw/USB,
+#     автозагрузка в /etc/modules-load.d/aic8800.conf, проверка modinfo
+#   - распаковывает заголовки — из headers/
 #
 # Использование:
 #   sudo ./install_kernel.sh                         — взять САМЫЙ СВЕЖИЙ подходящий архив
@@ -66,12 +68,12 @@ echo "Архив:        $PKG ($(du -h "$PKG" | cut -f1), $(date -r "$PKG" '+%Y-
 echo "Текущее ядро: $OLD_KVER"
 
 echo ""
-echo "=== [1/6] Зависимости ==="
+echo "=== [1/7] Зависимости ==="
 run apt-get update -qq
 run apt-get install -y rsync device-tree-compiler
 
 echo ""
-echo "=== [2/6] Распаковка архива ==="
+echo "=== [2/7] Распаковка архива ==="
 STAGE=$(mktemp -d)
 run tar xzf "$PKG" -C "$STAGE"
 if [[ ! -d "$STAGE/boot" || ! -d "$STAGE/headers" || ! -f "$STAGE/boot/Image" ]]; then
@@ -88,11 +90,18 @@ if [[ -f "$STAGE/headers/kernel.release" ]]; then
     HKVER=$(cat "$STAGE/headers/kernel.release")
     [[ "$HKVER" == "$KVER" ]] || die "версии не совпадают: модули=$KVER, headers=$HKVER"
 fi
+for need in "boot/lib/modules/${KVER}/updates/aic8800/aic_load_fw_usb.ko" \
+            "boot/lib/modules/${KVER}/updates/aic8800/aic8800_fdrv_usb.ko" \
+            "boot/lib/modules/${KVER}/updates/aic8800/aic_btusb_usb.ko" \
+            "boot/firmware/aic8800_fw/USB" "boot/aic8800.conf"; do
+    [[ -e "$STAGE/$need" ]] || die "в архиве нет $need — WiFi не установится. Пересоберите: ./full_deploy_ov9281.sh build <ИМЯ> (или wifi)"
+done
 echo "✅ Архив распакован, boot/ и headers/ на месте"
+echo "✅ WiFi AIC8800 в архиве: модули + прошивка + автозагрузка"
 echo "Новое ядро:   $KVER"
 
 echo ""
-echo "=== [3/6] Резервная копия текущего ядра ==="
+echo "=== [3/7] Резервная копия текущего ядра ==="
 BACKUP_DIR="/root/kernel_backup_$(date +%Y%m%d_%H%M%S)"
 run mkdir -p "$BACKUP_DIR"
 [[ -f /boot/vmlinuz-${OLD_KVER} ]] && run cp /boot/vmlinuz-${OLD_KVER} "$BACKUP_DIR/"
@@ -100,7 +109,7 @@ run mkdir -p "$BACKUP_DIR"
 echo "Бэкап: $BACKUP_DIR"
 
 echo ""
-echo "=== [4/6] Установка ядра, dtb, модулей (из boot/) ==="
+echo "=== [4/7] Установка ядра, dtb, модулей (из boot/) ==="
 run cp "$STAGE/boot/Image" "/boot/vmlinuz-${KVER}"
 echo "✅ vmlinuz-${KVER}"
 
@@ -122,7 +131,46 @@ echo "✅ модули"
 run cp "$STAGE/boot/config-plain" "/boot/config-${KVER}"
 
 echo ""
-echo "=== [5/6] Overlay камеры OV9281 (из boot/) ==="
+echo "=== [5/7] Установка WiFi-драйвера AIC8800 (готовые модули из архива, БЕЗ компиляции) ==="
+WIFI_MOD_DIR="/lib/modules/${KVER}/updates/aic8800"
+
+# 5.1 Модули: кладём явно (rsync выше их уже скопировал — повторяем, чтобы
+#     шаг был самодостаточным и не зависел от содержимого boot/lib/modules)
+run mkdir -p "$WIFI_MOD_DIR"
+run cp "$STAGE/boot/lib/modules/${KVER}/updates/aic8800/"*.ko "$WIFI_MOD_DIR/"
+# Старые DKMS-копии того же драйвера для этого ядра — убрать, чтобы не было дублей
+rm -f /lib/modules/${KVER}/updates/dkms/aic*_usb.ko* 2>/dev/null || true
+
+# 5.2 Прошивка
+run mkdir -p /lib/firmware/aic8800_fw/USB
+run rsync -a "$STAGE/boot/firmware/aic8800_fw/USB/" /lib/firmware/aic8800_fw/USB/
+
+# 5.3 Автозагрузка при старте
+run cp "$STAGE/boot/aic8800.conf" /etc/modules-load.d/aic8800.conf
+
+run depmod -a "$KVER"
+
+# 5.4 Проверка
+for m in aic_load_fw_usb aic8800_fdrv_usb aic_btusb_usb; do
+    f=$(modinfo -k "$KVER" -n "$m" 2>/dev/null || true)
+    [[ -n "$f" ]] || die "WiFi: модуль $m не виден для ядра $KVER после depmod"
+    vm=$(modinfo -k "$KVER" -F vermagic "$m" 2>/dev/null | awk '{print $1}' || true)
+    [[ "$vm" == "$KVER" ]] || die "WiFi: $m собран для '$vm', а ядро $KVER"
+    echo "✅ $m → $f"
+done
+FW_COUNT=$(find /lib/firmware/aic8800_fw/USB -type f | wc -l)
+[[ "$FW_COUNT" -gt 0 ]] || die "WiFi: прошивка /lib/firmware/aic8800_fw/USB пуста"
+echo "✅ прошивка: /lib/firmware/aic8800_fw/USB ($FW_COUNT файлов)"
+echo "✅ автозагрузка: /etc/modules-load.d/aic8800.conf ($(tr '\n' ' ' < /etc/modules-load.d/aic8800.conf))"
+
+if dpkg -s aic8800-usb-dkms &>/dev/null; then
+    echo "⚠  Установлен пакет aic8800-usb-dkms — он больше не нужен и может мешать. Удалить:"
+    echo "     sudo apt-mark unhold aic8800-usb-dkms; sudo dpkg -r aic8800-usb-dkms"
+fi
+echo "✅ WiFi AIC8800 установлен — заработает после reboot в $KVER"
+
+echo ""
+echo "=== [6/7] Overlay камеры OV9281 (из boot/) ==="
 if [[ -f "$STAGE/boot/overlay.dts" ]]; then
     run dtc -@ -I dts -O dtb -o /tmp/rock-4d-ov9281.dtbo "$STAGE/boot/overlay.dts"
     run mkdir -p /boot/dtbo
@@ -139,7 +187,7 @@ if [[ -f "$STAGE/boot/live_auto_exposure.cpp" ]]; then
 fi
 
 echo ""
-echo "=== [6/6] Заголовки (из headers/, БЕЗ компиляции — сделает install_wifi.sh) ==="
+echo "=== [7/7] Заголовки (из headers/) ==="
 HEADERS_DIR="/usr/src/linux-headers-$KVER"
 run rm -rf "$HEADERS_DIR"
 run mkdir -p "$HEADERS_DIR"
@@ -148,7 +196,7 @@ run ln -sfn "$HEADERS_DIR" "/lib/modules/${KVER}/build"
 run ln -sfn "$HEADERS_DIR" "/lib/modules/${KVER}/source"
 [[ -s "$HEADERS_DIR/Module.symvers" ]] || echo "⚠  $HEADERS_DIR/Module.symvers пустой/отсутствует — WiFi-модуль может не загрузиться"
 echo "✅ Заголовки распакованы в $HEADERS_DIR"
-echo "   (host-инструменты scripts/ пока x86_64 — install_wifi.sh пересоберёт их нативно)"
+echo "   (scripts/ — x86 из WSL; для сборки ДРУГИХ модулей на плате запустите install_wifi.sh, он пересоберёт их)"
 
 run rm -rf "$STAGE"
 STAGE=""
@@ -170,7 +218,8 @@ echo ""
 echo " Архив:          $PKG"
 echo " Новое ядро:     $KVER"
 echo " OV9281 overlay: /boot/dtbo/rock-4d-ov9281.dtbo"
-echo " Заголовки:      $HEADERS_DIR (готовы для install_wifi.sh)"
+echo " WiFi AIC8800:   /lib/modules/$KVER/updates/aic8800 (готовые модули)"
+echo " Заголовки:      $HEADERS_DIR"
 echo ""
 echo " Метку загрузки по умолчанию нужно выставить вручную:"
 echo "   grep -B1 'menu label.*$KVER' /boot/extlinux/extlinux.conf"
@@ -180,5 +229,6 @@ echo ""
 echo " ДАЛЬШЕ:"
 echo "   sudo reboot"
 echo "   uname -r                    (ожидается: $KVER)"
-echo "   sudo ./install_wifi.sh      (сборка scripts + WiFi-драйвера НАТИВНО)"
+echo "   ip -br link                 (должен появиться wl*-интерфейс)"
+echo "   nmcli device wifi list"
 echo "============================================================"

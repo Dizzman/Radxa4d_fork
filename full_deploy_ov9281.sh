@@ -6,7 +6,7 @@
 # На плате НИЧЕГО не компилируется: в архиве уже лежат готовые
 # aic*_usb.ko и прошивка. install_wifi.sh больше не нужен (запасной вариант).
 #
-# Создаётся ОДИН архив ov9281-<версия>.tar.gz:
+# Создаётся ОДИН архив wsl-ov9281-<версия>.tar.gz:
 #   boot/     — Image + modules (вкл. updates/aic8800/*.ko) + dtb + overlay +
 #               config-plain + firmware/aic8800_fw/USB + aic8800.conf +
 #               live_auto_exposure.cpp
@@ -32,6 +32,7 @@ CROSS_COMPILE=aarch64-linux-gnu-
 BOARD_USER=radxa
 CUR_DIR=$(pwd)
 LOG="deploy_ov9281.log"
+PKG_PREFIX="wsl-ov9281"   # префикс архива: wsl- = собрано (кросс-компиляция) в WSL
 
 log()  { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 err()  { echo "ОШИБКА: $*" >&2; echo "[$(date '+%H:%M:%S')] ОШИБКА: $*" >> "$LOG"; }
@@ -153,10 +154,14 @@ build_aic8800() {
     run cp "$drv/aic_btusb/aic_btusb.ko"                 "$AIC_OUT/aic_btusb_usb.ko"
     run ${CROSS_COMPILE}strip --strip-debug "$AIC_OUT"/*.ko
 
-    local ko vm
+    # Без пайпов с ранним выходом (grep -q / grep -m1): при pipefail они
+    # дают SIGPIPE и set -e молча роняет скрипт.
+    local ko vm finfo
     for ko in "$AIC_OUT"/*.ko; do
-        file "$ko" | grep -q "ARM aarch64" || die "$(basename "$ko") — не ARM64: $(file -b "$ko")"
-        vm=$(strings "$ko" | grep -m1 '^vermagic=' | cut -d= -f2 | awk '{print $1}')
+        finfo=$(file -b "$ko" 2>&1 || true)
+        [[ "$finfo" == *"ARM aarch64"* ]] || die "$(basename "$ko") — не ARM64: $finfo"
+        vm=$(${CROSS_COMPILE}objcopy -O binary --only-section=.modinfo "$ko" /dev/stdout 2>/dev/null \
+             | tr '\0' '\n' | awk -F= '$1=="vermagic"{split($2,a," "); print a[1]; exit}' || true)
         [[ "$vm" == "$kver" ]] || die "$(basename "$ko"): vermagic '$vm' ≠ ядру '$kver'"
         ok "$(basename "$ko") — ARM64, vermagic $vm, $(du -h "$ko" | cut -f1)"
     done
@@ -182,7 +187,7 @@ cmd_clean() {
     ok "Ядро очищено (.config удалён — build сам возьмёт свежий из эталона)"
 
     log "Удаление архивов..."
-    run rm -f ov9281-*.tar.gz
+    run rm -f ${PKG_PREFIX}-*.tar.gz ov9281-*.tar.gz
 
     log "Удаление временных файлов..."
     run rm -rf /tmp/modules_* /tmp/kernel_pkg_* /tmp/headers_* /tmp/ov9281_pkg_*
@@ -467,18 +472,18 @@ cmd_package() {
 
     echo "$kver" > "$staging/headers/kernel.release"
 
-    log "=== Сборка единого архива ov9281-$kver.tar.gz ==="
-    run tar czf "$CUR_DIR/ov9281-$kver.tar.gz" -C "$staging" . || die "Ошибка создания архива"
-    ok "Архив создан: ov9281-$kver.tar.gz ($(du -h "$CUR_DIR/ov9281-$kver.tar.gz" | cut -f1))"
+    log "=== Сборка единого архива ${PKG_PREFIX}-$kver.tar.gz ==="
+    run tar czf "$CUR_DIR/${PKG_PREFIX}-$kver.tar.gz" -C "$staging" . || die "Ошибка создания архива"
+    ok "Архив создан: ${PKG_PREFIX}-$kver.tar.gz ($(du -h "$CUR_DIR/${PKG_PREFIX}-$kver.tar.gz" | cut -f1))"
 
     log "=== Список файлов в архиве (первые 60 на экран, полный список — в $LOG) ==="
-    tar tzvf "$CUR_DIR/ov9281-$kver.tar.gz" > /tmp/pkg_manifest_$kver.txt
+    tar tzvf "$CUR_DIR/${PKG_PREFIX}-$kver.tar.gz" > /tmp/pkg_manifest_$kver.txt
     cat /tmp/pkg_manifest_$kver.txt >> "$LOG"
     head -60 /tmp/pkg_manifest_$kver.txt
     log "Всего файлов в архиве: $(wc -l < /tmp/pkg_manifest_$kver.txt) (полный список — в $LOG)"
 
     # Самопроверка архива: именно это проверяет install_kernel.sh на плате.
-    tar tzf "$CUR_DIR/ov9281-$kver.tar.gz" > /tmp/pkg_names_$kver.txt
+    tar tzf "$CUR_DIR/${PKG_PREFIX}-$kver.tar.gz" > /tmp/pkg_names_$kver.txt
     local need
     for need in "./boot/Image" "./boot/config-plain" "./boot/overlay.dts" \
                 "./boot/lib/modules/$kver/modules.dep" \
@@ -486,7 +491,7 @@ cmd_package() {
                 "./boot/lib/modules/$kver/updates/aic8800/aic_load_fw_usb.ko" \
                 "./boot/firmware/aic8800_fw/USB" "./boot/aic8800.conf" \
                 "./headers/kernel.release" "./headers/Module.symvers" "./headers/.config"; do
-        grep -qxF "$need" /tmp/pkg_names_$kver.txt || die "В архиве НЕТ $need — архив неполный, на плату не отправлять!"
+        grep -qxF -e "$need" -e "$need/" /tmp/pkg_names_$kver.txt || die "В архиве НЕТ $need — архив неполный, на плату не отправлять!"
     done
     [[ -s Module.symvers ]] || die "Module.symvers пустой — WiFi-модуль на плате не загрузится"
     rm -f /tmp/pkg_names_$kver.txt
@@ -509,14 +514,14 @@ cmd_package() {
     [[ -f "$CUR_DIR/.ov9281_last_ip" ]] && ip_hint=$(cat "$CUR_DIR/.ov9281_last_ip")
 
     echo "============================================================"
-    echo " АРХИВ ГОТОВ: ov9281-$kver.tar.gz ($(du -h "$CUR_DIR/ov9281-$kver.tar.gz" | cut -f1))"
+    echo " АРХИВ ГОТОВ: ${PKG_PREFIX}-$kver.tar.gz ($(du -h "$CUR_DIR/${PKG_PREFIX}-$kver.tar.gz" | cut -f1))"
     echo ""
     echo " ОТПРАВКА НА ПЛАТУ (одна из двух команд):"
     echo ""
     echo "   ./deploy_ov9281.sh deploy $ip_hint"
     echo ""
     echo "   или вручную:"
-    echo "   scp \"ov9281-$kver.tar.gz\" install_kernel.sh $BOARD_USER@$ip_hint:~/"
+    echo "   scp \"${PKG_PREFIX}-$kver.tar.gz\" install_kernel.sh $BOARD_USER@$ip_hint:~/"
     echo ""
     echo " НА ПЛАТЕ:"
     echo "   ssh $BOARD_USER@$ip_hint"
@@ -535,6 +540,13 @@ cmd_package() {
 cmd_deploy() {
     local ip="$1"
     [[ -n "$ip" ]] || die "Укажите IP: $0 deploy <IP>"
+    # Защита от путаницы "deploy <ИМЯ_ВЕРСИИ>" вместо "deploy <IP>"
+    if ! [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && ! getent hosts "$ip" &>/dev/null; then
+        die "'$ip' — не IP и не известное имя хоста. deploy только ОТПРАВЛЯЕТ на плату.
+   Собрать всё (ядро + WiFi) в архив:  $0 build $ip
+   Отправить на плату:                 $0 deploy <IP_платы>
+   Собрать и сразу отправить:          $0 all <IP_платы> $ip"
+    fi
 
     [[ -f .ov9281_kver ]] || die "Сначала выполните: $0 build <ИМЯ>"
     local kver
@@ -542,7 +554,7 @@ cmd_deploy() {
     log "Версия: $kver"
     echo "$ip" > "$CUR_DIR/.ov9281_last_ip"
 
-    local pkg="$CUR_DIR/ov9281-$kver.tar.gz"
+    local pkg="$CUR_DIR/${PKG_PREFIX}-$kver.tar.gz"
     [[ -f "$pkg" ]] || die "Не найден $pkg — сначала выполните: $0 build <ИМЯ>"
 
     step "ОТПРАВКА НА ПЛАТУ $ip"
@@ -565,9 +577,9 @@ cmd_deploy() {
 
     # Старые архивы на плате ломают install_kernel.sh (мог взять не тот) —
     # переносим их в ~/ov9281_old/ (не удаляем).
-    log "Перенос старых ov9281-*.tar.gz на плате в ~/ov9281_old/ ..."
+    log "Перенос старых *ov9281-*.tar.gz на плате в ~/ov9281_old/ ..."
     run ssh -o ConnectTimeout=10 "$BOARD_USER@$ip" \
-        'mkdir -p ~/ov9281_old; for f in ~/ov9281-*.tar.gz; do [ -e "$f" ] && mv -v "$f" ~/ov9281_old/; done; true' \
+        'mkdir -p ~/ov9281_old; for f in ~/ov9281-*.tar.gz ~/wsl-ov9281-*.tar.gz; do [ -e "$f" ] && mv -v "$f" ~/ov9281_old/; done; true' \
         || warn "Не удалось почистить старые архивы на плате — проверьте ~ вручную"
 
     run scp -o ConnectTimeout=10 "${files_to_copy[@]}" "$BOARD_USER@$ip":~/ || die "Не удалось скопировать файлы"
@@ -649,7 +661,7 @@ drivers/media/i2c/ov9281.o перед полной сборкой Image+modules+
   ip -br link ; nmcli device wifi list
 
 Файлы:
-  ov9281-<версия>.tar.gz  — ОДИН архив: boot/ (Image+modules+WiFi+dtb+overlay+cpp)
+  wsl-ov9281-<версия>.tar.gz  — ОДИН архив: boot/ (Image+modules+WiFi+dtb+overlay+cpp)
                             + headers/
 
 Лог: $LOG
