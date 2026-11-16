@@ -373,18 +373,20 @@ echo "============================================================"
 # Все версии ядер, видимые загрузчику (/boot/vmlinuz-*)
 list_kernels() { ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|^/boot/vmlinuz-||' | sort -V; }
 
-# remove_kernel <версия> — удалить ядро целиком (через apt, если оно из пакета)
+# is_factory_kernel <версия> — ядро установлено из пакета (заводское Radxa)
+is_factory_kernel() { dpkg -S "/boot/vmlinuz-$1" &>/dev/null; }
+
+# remove_kernel <версия> — удалить ВРУЧНУЮ собранное ядро (файлы).
+# Заводские (из пакетов) НЕ трогаются никогда — ни apt, ни dpkg.
 remove_kernel() {
-    local v="$1" pkgs
-    pkgs=$(dpkg -S "/boot/vmlinuz-$v" "/lib/modules/$v" "/usr/src/linux-headers-$v" 2>/dev/null \
-           | cut -d: -f1 | tr ',' '\n' | sed 's/^ *//' | sort -u | tr '\n' ' ' || true)
-    if [[ -n "${pkgs// /}" ]]; then
-        echo "  → $v из пакетов: $pkgs— удаляю через apt"
-        # shellcheck disable=SC2086
-        DEBIAN_FRONTEND=noninteractive apt-get purge -y $pkgs || echo "  ⚠ apt не смог удалить $pkgs"
+    local v="$1"
+    if is_factory_kernel "$v"; then
+        echo "  ⏭  $v — заводское (из пакета), не трогаю"
+        return 0
     fi
     rm -f  "/boot/vmlinuz-$v" "/boot/initrd.img-$v" "/boot/config-$v" "/boot/System.map-$v"
     rm -rf "/lib/modules/$v" "/usr/lib/linux-image-$v" "/usr/src/linux-headers-$v"
+    rm -rf /var/lib/dkms/*/*/"$v" 2>/dev/null || true
     echo "  ✅ удалено: $v"
 }
 
@@ -407,30 +409,31 @@ else
     pin_boot_default "$KVER" || true
 
     # ---------- Вопрос: оставить только текущую + новую систему ----------
-    KEEP=("$OLD_KVER" "$KVER")
-    TO_REMOVE=()
+    TO_REMOVE=(); FACTORY=()
     for v in $(list_kernels); do
-        [[ "$v" == "$OLD_KVER" || "$v" == "$KVER" ]] || TO_REMOVE+=("$v")
+        [[ "$v" == "$OLD_KVER" || "$v" == "$KVER" ]] && continue
+        if is_factory_kernel "$v"; then FACTORY+=("$v"); else TO_REMOVE+=("$v"); fi
     done
 
     echo ""
     echo "================================================================"
-    echo "  ОЧИСТКА МЕНЮ ЗАГРУЗКИ"
-    echo "  Останутся две системы:"
+    echo "  ОЧИСТКА: удалить ВРУЧНУЮ собранные ядра, кроме текущего и нового"
+    echo "  Останутся:"
     echo "     $OLD_KVER   (текущая, запущена сейчас)"
     [[ "$KVER" != "$OLD_KVER" ]] && echo "     $KVER   (новая, по умолчанию)"
+    for v in "${FACTORY[@]}"; do echo "     $v   (заводское ядро Radxa — НЕ удаляется никогда)"; done
     echo "  + убираются rescue-пункты (l0r, l1r ...)"
     if [[ ${#TO_REMOVE[@]} -gt 0 ]]; then
-        echo "  Будут УДАЛЕНЫ ядра (vmlinuz, initrd, модули, dtb, заголовки):"
+        echo "  Будут УДАЛЕНЫ (собраны вручную):"
         for v in "${TO_REMOVE[@]}"; do echo "     ❌ $v"; done
     else
-        echo "  Других ядер нет — удалять нечего, только rescue-пункты."
+        echo "  Вручную собранных ядер для удаления нет — уберутся только rescue-пункты."
     fi
     echo "================================================================"
 
     ANSWER=""
     if [[ -r /dev/tty ]]; then
-        read -r -p "  Очистить всё, кроме этих двух систем? [Yes/No]: " ANSWER < /dev/tty || ANSWER=""
+        read -r -p "  Удалить перечисленные ядра? [Yes/No]: " ANSWER < /dev/tty || ANSWER=""
     else
         echo "  (нет терминала — ответ по умолчанию: No)"
     fi
